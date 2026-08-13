@@ -1,0 +1,10 @@
+/target
+**/node_modules
+web/dist
+*.db
+*.db-journal
+.DS_Store
+.env
+
+# Verification screenshots from manual/agent runs — artefacts, never sources.
+.kibitz-shots/

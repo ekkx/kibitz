@@ -1,0 +1,22 @@
+# Keep the build context small and, more importantly, free of host artefacts:
+# anything copied in from the host would make the image depend on the machine
+# that built it.
+
+# Host build output. The image builds its own.
+target/
+**/node_modules/
+web/dist/
+
+# Not needed to build, and .git changes on every commit, which would bust the
+# cache of every layer that copies it.
+.git/
+.gitignore
+.github/
+
+# Local state and secrets.
+*.db
+*.db-journal
+.env
+.env.*
+
+.DS_Store

@@ -1,0 +1,63 @@
+name: kibitz
+
+services:
+  # `docker compose up -d` → http://127.0.0.1:7777
+  kibitz:
+    build:
+      context: .
+      target: runtime
+    image: kibitz:0.1.0
+    ports:
+      # Loopback only. kibitz has no auth and is a single-user local tool;
+      # binding 0.0.0.0 on the host would put an unauthenticated engine on the
+      # network. Set KIBITZ_HOST_PORT if 7777 is already taken on the host —
+      # for example by a `cargo run` server.
+      - "127.0.0.1:${KIBITZ_HOST_PORT:-7777}:7777"
+    volumes:
+      # ~/.kibitz/kibitz.db — the analysis, explanation and book caches. Losing
+      # it on every restart would mean re-running the engine over games that
+      # were already analysed.
+      - kibitz-cache:/home/kibitz/.kibitz
+    environment:
+      # Every variable from README.md's configuration table, passed through from
+      # the host environment or a .env file next to this file. The values after
+      # `:-` are the defaults the container ships with.
+      #
+      # anthropic, not the claude-code default: the `claude` CLI is not in the
+      # image. With ANTHROPIC_API_KEY set, explanations work. Without it, no
+      # provider is configured and the server says so — analysis,
+      # classification and the board are unaffected, only written explanations
+      # answer 503. See docs/DOCKER.md.
+      KIBITZ_LLM: "${KIBITZ_LLM:-anthropic}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      KIBITZ_MODEL_NARRATE: "${KIBITZ_MODEL_NARRATE:-claude-haiku-4-5}"
+      KIBITZ_MODEL_REASON: "${KIBITZ_MODEL_REASON:-claude-opus-5}"
+      KIBITZ_STOCKFISH: "${KIBITZ_STOCKFISH:-/usr/local/bin/stockfish}"
+      KIBITZ_BOOK_DB: "${KIBITZ_BOOK_DB:-masters}"
+      KIBITZ_BOOK_URL: "${KIBITZ_BOOK_URL:-https://explorer.lichess.ovh}"
+      KIBITZ_LOG: "${KIBITZ_LOG:-kibitz=info}"
+    healthcheck:
+      # /api/health reports the `id name` line from a real UCI handshake, so
+      # `"ok":true` means Stockfish actually started and answered — not merely
+      # that the HTTP server is up.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:7777/api/health | grep -q '\"ok\":true'"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+  # docker compose --profile test run --rm test
+  test:
+    build:
+      context: .
+      target: test
+    image: kibitz-test:0.1.0
+    profiles: ["test"]
+    environment:
+      KIBITZ_STOCKFISH: /usr/local/bin/stockfish
+    # No ports, no volumes: the suite must not depend on a running server or on
+    # a cache left behind by an earlier run.
+
+volumes:
+  kibitz-cache:

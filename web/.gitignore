@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.local
+.DS_Store
+# Verification screenshots — artefacts of a manual run, never sources.
+.screenshots/

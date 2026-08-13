@@ -1,0 +1,218 @@
+/*
+ * kibitz — what is left when the UI is a design system.
+ *
+ * The app used to be ~1100 lines of hand-written CSS. It is now shadcn/ui on
+ * Tailwind v4 (`index.css` holds the palette, the components hold their own
+ * classes), and this file is the residue: the three things that are genuinely
+ * not utility classes and would be worse as any.
+ *
+ * The test each rule below had to pass is not "is it shorter here" — a utility
+ * class is always available and almost always shorter. It is whether the thing
+ * being styled is *addressable* from a component at all:
+ *
+ *   1. The classification colours are picked at runtime from server data, by
+ *      name. `classificationColor('blunder')` returns `var(--blunder)` and that
+ *      string is handed to `style`, to an SVG `fill`, and to a `<b>` in a
+ *      sentence assembled by the translation catalogue. A Tailwind class cannot
+ *      be a value, and the nine-way lookup table it would take to turn the name
+ *      into one would have to be written three times over.
+ *
+ *   2. The eval bar is a bespoke component the user asked to keep. Its label
+ *      trick — one label per end, each `mix-blend-mode: difference` against a
+ *      bar whose fill moves under it — is the whole design, and it is three
+ *      rules that belong together.
+ *
+ *   3. The move badge is drawn geometry (`components/MoveBadge.tsx`), and what
+ *      is left here is the look of the disc it is drawn on.
+ *
+ * Everything else went. Nothing here defines a surface, a text colour, a border,
+ * a radius or a font: those are `index.css`'s, exclusively, which is why the
+ * three-token collision the migration started with no longer exists. Board
+ * theming lives in `components/board.css`, next to the sheet it argues with.
+ */
+
+/* ==========================================================================
+ * Move classification colours
+ * ==========================================================================
+ *
+ * DELIBERATELY THEME-INDEPENDENT — one value, no dark-mode block. These are the
+ * only colours in the app that mean something rather than being a surface or a
+ * role, and what they mean is the same in either theme: a blunder is red because
+ * it is a blunder. They are also the only colours allowed to be saturated, which
+ * is what lets a badge on the board, a glyph in the move list and a count in the
+ * sweep summary be recognised as the same claim without reading a word.
+ *
+ * The ramp is a single perceptual gradient from blue-green through olive to red,
+ * with `book` parked in warm grey off to one side because "this is theory" is
+ * not a point on the good-to-bad axis at all.
+ *
+ * They are tuned to sit on the board (`components/board.css`), which is the
+ * least forgiving ground they land on: nine hues against two desaturated
+ * browns. Changing one is safe; changing the family means re-checking it there
+ * first, and `MoveBadge.tsx` documents why the discs have nothing but colour to
+ * separate them from the squares.
+ */
+:root {
+  --great: #3b82c4;
+  --best: #5b9c48;
+  --excellent: #6ea355;
+  --good: #8b9068;
+  --book: #8a857c;
+  --inaccuracy: #c99a2c;
+  --mistake: #d4802b;
+  --blunder: #c93f38;
+  --miss: #b1554f;
+}
+
+/* ==========================================================================
+ * Eval bar
+ * ==========================================================================
+ *
+ * The bar is literal: it is White's share of the position drawn as White's
+ * share of a rectangle, so its two colours are the two colours of a chess set
+ * and not a UI role. They are warmed into the palette's hue family — ivory
+ * rather than #fff, roasted brown rather than #000 — and they carry a theme,
+ * because a bar of true white beside a 0.16-lightness page is a lamp.
+ */
+:root {
+  --bar-white: oklch(0.94 0.016 78);
+  --bar-black: oklch(0.32 0.018 66);
+}
+
+/*
+ * Dark keeps the same pair, but the black end stops well short of the page
+ * (0.16): a bar whose losing half is the same value as the background reads as
+ * a bar that is only half there, and the full length of it is the scale the
+ * fill is measured against.
+ */
+:root[data-theme='dark'] {
+  --bar-white: oklch(0.87 0.018 78);
+  --bar-black: oklch(0.3 0.016 66);
+}
+
+.evalbar {
+  position: relative;
+  width: 1.75rem;
+  flex: 0 0 1.75rem;
+  overflow: hidden;
+  border-radius: var(--radius-lg);
+  background: var(--bar-black);
+  /* Same ring the cards use, so the bar is bounded the way every other surface
+     on the page is bounded. */
+  box-shadow: 0 0 0 1px color-mix(in oklab, var(--foreground) 8%, transparent);
+}
+
+.evalbar__white {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: var(--bar-white);
+  transition: height 300ms cubic-bezier(0.3, 0.7, 0.3, 1);
+}
+
+/* The half-way line: the only fixed reference on a bar that is otherwise all
+   movement, and the thing that makes "slightly better" legible as slightly. */
+.evalbar__mid {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  border-top: 1px dashed color-mix(in oklab, var(--bar-white) 40%, transparent);
+}
+
+/*
+ * The score, printed at whichever end of the bar White is on — one label, at
+ * the top or the bottom depending on which way round the board is.
+ *
+ * `mix-blend-mode: difference` is what lets that one element stay legible over
+ * a boundary that moves under it: the label sits at White's end, so its ground
+ * is the white fill in most positions and the black fill in the few where White
+ * has nothing left. `difference` paints |backdrop − colour|, so a label coloured
+ * *the same as the white fill* comes out near-black on white and near-white on
+ * black. Both cases legible, no JavaScript watching the fill height, and no
+ * third colour that would have to be a compromise between the two.
+ *
+ * Which is why both variants below are `--bar-white` and only their position
+ * differs. Colouring the bottom one `--bar-black`, as this once did, gets the
+ * subtraction backwards: it renders mid-grey on white, at the exact moment the
+ * bar is full because someone is winning and the number is worth reading.
+ */
+.evalbar__label {
+  position: absolute;
+  left: 0;
+  right: 0;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  font-weight: 600;
+  letter-spacing: -0.04em;
+  color: var(--bar-white);
+  mix-blend-mode: difference;
+}
+
+.evalbar__label--top {
+  top: 0.25rem;
+}
+
+.evalbar__label--bottom {
+  bottom: 0.25rem;
+}
+
+/* ==========================================================================
+ * Move classification badge
+ * ==========================================================================
+ *
+ * Position, size and fill come from the component (`components/MoveBadge.tsx`),
+ * which owns the geometry and the classification colour; everything left here
+ * is the look of the disc.
+ *
+ * z-index 10 puts it over the pieces (2), over a piece mid-animation (8) and
+ * over chessground's custom-SVG layer (9), but under a piece being dragged
+ * (11): the badge should never hide the piece the user is holding, and a drag
+ * is the one moment the board is being used rather than read.
+ */
+.move-badge {
+  position: absolute;
+  z-index: 10;
+  box-sizing: border-box;
+  border-radius: 50%;
+  /* The disc colours are theme-independent by design, so the mark is literal
+     white rather than a token that would flip in dark mode and leave a dark
+     drawing on a mid-tone disc. The SVG paints with `currentColor`, so this one
+     declaration is the whole ink colour of the mark set. */
+  color: #fff;
+  /* A flat disc of one colour, and nothing else: no ring, no rim, no gradient,
+     no shadow.
+
+     This is the deliberate end of three attempts, each of which added something
+     to make the badge "read", and each of which made it read as a sticker lying
+     on the board instead of a mark belonging to it. The white halo it started
+     with separated the badge from everything, always, whether or not separation
+     was needed. A dark hairline plus a soft drop shadow replaced it and was
+     quieter but still an outline, still a thing the eye resolves before it
+     resolves the mark. A faint highlight-to-shade gradient over the fill dated
+     it further.
+
+     What actually does the separating is the colour, and it is enough: the
+     classification palette is nine saturated hues against a board of two
+     desaturated browns, so every disc differs from both squares in chroma even
+     where it is close in lightness. The two that come closest are `good` (olive)
+     and `book` (warm grey) on the dark square, and both hold on hue. If one ever
+     genuinely disappears, the fix is that classification's colour or the mark's
+     contrast — never an outline back. See `MoveBadge.tsx` for the marks that
+     carry the badge now that nothing else is decorating it. */
+  /* The square underneath stays draggable: the badge describes the board, it
+     does not take part in it. */
+  pointer-events: none;
+  user-select: none;
+}
+
+/* The drawn mark fills the disc's box; the geometry inside it (`BADGE_MARK`)
+   is what decides how much of the disc the ink actually covers, so this never
+   needs a size of its own and never needs to change when a mark does. */
+.move-badge-mark {
+  display: block;
+  width: 100%;
+  height: 100%;
+}

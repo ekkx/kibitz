@@ -1,0 +1,44 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/engine",
+    "crates/book",
+    "crates/llm",
+    "crates/store",
+    "crates/server",
+    "cmd",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# GPL-3.0, not by preference but by obligation: the frontend links chessground,
+# which is GPL-3.0-or-later, so the distributed work has to be. See README.
+license = "GPL-3.0-or-later"
+repository = "https://github.com/ekkx/kibitz"
+
+[workspace.dependencies]
+kibitz-core = { path = "crates/core" }
+kibitz-engine = { path = "crates/engine" }
+kibitz-book = { path = "crates/book" }
+kibitz-llm = { path = "crates/llm" }
+kibitz-store = { path = "crates/store" }
+kibitz-server = { path = "crates/server" }
+
+shakmaty = { version = "0.30", features = ["serde"] }
+pgn-reader = "0.29"
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+tower-http = { version = "0.7", features = ["cors", "fs", "trace"] }
+reqwest = { version = "0.13", features = ["json"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+futures = "0.3"
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

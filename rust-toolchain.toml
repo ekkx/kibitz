@@ -1,0 +1,8 @@
+# The one place the Rust version is stated. rustup reads this on the host, and
+# the Dockerfile's builder image is pinned to the same version, so a host build
+# and a container build use the same compiler.
+#
+# Keep `channel` in sync with the `RUST_VERSION` ARG in the Dockerfile.
+[toolchain]
+channel = "1.95.0"
+profile = "minimal"

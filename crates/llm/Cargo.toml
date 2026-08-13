@@ -1,0 +1,20 @@
+[package]
+name = "kibitz-llm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kibitz-core.workspace = true
+tokio.workspace = true
+# `stream` adds `Response::bytes_stream`, needed to read the SSE body.
+reqwest = { workspace = true, features = ["stream"] }
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Cache keys need a hash that is stable across processes and releases;
+# `DefaultHasher` guarantees neither.
+sha2 = "0.10"

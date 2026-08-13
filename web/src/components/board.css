@@ -1,0 +1,213 @@
+/**
+ * Our overrides of chessground's own stylesheet.
+ *
+ * Kept in its own file, imported straight after the three chessground sheets in
+ * `Board.tsx`, so that what we change about the board — and why — is readable in
+ * one place instead of being scattered through the app's stylesheet, where it
+ * would look like ordinary styling rather than an argument with a dependency.
+ *
+ * Two kinds of thing live here. First the board's *theme*, which is the whole
+ * second half of the file: chessground's `brown` sheet is replaced square by
+ * square so the board belongs to the milk-coffee palette instead of sitting on
+ * it like a screenshot from another program. Second, the handful of behavioural
+ * disagreements — currently one, the capture fade below.
+ */
+
+/* The board's box is the square its parent gives it; chessground itself has no
+   opinion about size. */
+.cg-wrap {
+  width: 100%;
+  height: 100%;
+}
+
+/**
+ * A captured piece is replaced, not dissolved.
+ *
+ * chessground marks a piece that is about to disappear `.fading` and gives it
+ * `opacity: 0.5` for the whole length of the animation (`chessground.base.css`).
+ * It does not actually fade — the value is constant — so what you see when one
+ * piece takes another is the captured piece sitting there at half strength while
+ * the capturing piece slides onto it, the two overlapping as ghosts for the
+ * entire duration. At the replay's 420ms that is long enough to read as a
+ * rendering fault rather than as an effect.
+ *
+ * Full opacity instead. The captured piece stands its ground, solid, until the
+ * piece taking it arrives and is removed at the moment it is covered — which is
+ * what taking a piece looks like. chessground already puts the moving piece at
+ * `z-index: 8` and the fading one at `1`, so the capturer lands on top and the
+ * substitution happens under it, in one frame, with nothing translucent at any
+ * point.
+ *
+ * The alternative — `opacity: 0`, so the square empties the instant the move
+ * starts — was rejected: it makes the piece vanish before anything reaches it,
+ * which reads as the piece fleeing rather than as being taken.
+ */
+.cg-wrap piece.fading {
+  opacity: 1;
+}
+
+/* ==========================================================================
+ * The board theme
+ * ==========================================================================
+ *
+ * chessground's `brown` theme is `#f0d9b5` plus a base64 SVG of 20%-black
+ * squares plus a set of highlight rules, and every one of those numbers is
+ * fixed. The board is the largest object on the page, so leaving it fixed means
+ * the palette is decided by a dependency: a lichess-brown board next to warm
+ * neutral surfaces reads as two programs, and it cannot follow the theme —
+ * which is why the old stylesheet reached for `filter: brightness(0.86)` on
+ * `cg-board` in dark mode. That filter is gone. It applied to the element that
+ * *contains the pieces and the highlights*, so it dimmed the pieces, the check
+ * glow and the arrows along with the squares, to make the squares darker. The
+ * squares are darker here because they are a different colour.
+ *
+ * Everything is expressed as six variables per theme so the board can be
+ * retuned without reading a single rule below. They sit on `.cg-wrap` rather
+ * than `:root` because they describe one component, and `.cg-wrap` is the
+ * outermost element chessground owns.
+ *
+ * The hue is 70-ish throughout — the same family as `index.css`, and the same
+ * three knobs (hue, chroma, lightness) apply. The board is allowed noticeably
+ * more chroma than any UI surface: it is the one large area that is *supposed*
+ * to read as coloured, and dropping it to surface chroma produces a grey board
+ * that looks broken rather than restrained.
+ */
+.cg-wrap {
+  --board-light: oklch(0.915 0.026 76);
+  --board-dark: oklch(0.715 0.05 66);
+
+  /* The move-destination dots and the ring on an occupied capture square. Ink,
+     not colour: they mark *where you may go*, which is a fact about the rules
+     and not a judgement, so they say it in the same grey-brown the coordinates
+     use rather than borrowing the engine's green. */
+  --board-mark: oklch(0.32 0.03 66 / 45%);
+
+  /* The move that was just played. The same hue as the squares with the chroma
+     pushed up: the highlight reads as those two squares lit rather than as a
+     yellow rectangle laid over them, which is what chessground's acid
+     `rgba(155, 199, 0, 0.41)` does to a warm board. */
+  --board-last-move: oklch(0.84 0.14 82 / 48%);
+
+  /* The square you are holding. Deliberately stronger than the last-move wash:
+     one is history, the other is a live selection, and telling them apart at a
+     glance matters while dragging. */
+  --board-selected: oklch(0.7 0.12 70 / 62%);
+
+  /* Check. The one thing on the board that is allowed to leave the palette —
+     it is an alarm, and it is the same red as `--destructive`. */
+  --board-check: oklch(0.6 0.23 27);
+
+  /* Coordinates, in the two alternating colours chessground draws them in: one
+     for labels sitting on a dark square, one for labels on a light square. */
+  --board-coord-on-dark: oklch(0.97 0.02 82 / 78%);
+  --board-coord-on-light: oklch(0.38 0.045 66 / 78%);
+}
+
+:root[data-theme='dark'] .cg-wrap {
+  /* Not the light board dimmed — a board with its own ramp. It sits between the
+     page (0.16) and the pieces, light enough that a white piece still reads as
+     white against it and dark enough that the board is not the brightest thing
+     on a dark screen. */
+  --board-light: oklch(0.695 0.032 74);
+  --board-dark: oklch(0.495 0.038 66);
+
+  /* Ink inverts: a dark dot on a mid-dark square is a hole, not a mark. */
+  --board-mark: oklch(0.96 0.02 80 / 52%);
+  --board-last-move: oklch(0.78 0.13 82 / 42%);
+  --board-selected: oklch(0.72 0.12 72 / 55%);
+  --board-check: oklch(0.65 0.22 25);
+  --board-coord-on-dark: oklch(0.96 0.02 82 / 72%);
+  --board-coord-on-light: oklch(0.28 0.04 66 / 80%);
+}
+
+/*
+ * The squares themselves.
+ *
+ * chessground paints one flat colour and lays a base64 SVG of 20%-black rects
+ * over it, so its two squares can only ever be a colour and that colour
+ * darkened — there is no way to give the dark square its own hue or its own
+ * chroma. A repeating conic gradient replaces the asset with four quadrants of
+ * two independent colours, tiled at a quarter of the board: each tile is two
+ * squares by two, four tiles across, eight squares. The quadrant order puts the
+ * dark square top-right and bottom-left of each tile, which is a1 dark and h1
+ * light — the board every chess player expects, and the one chessground's own
+ * asset draws.
+ *
+ * Being a gradient rather than an image, it also costs no request, no base64
+ * blob in the stylesheet, and nothing to keep in step with the theme.
+ */
+cg-board {
+  background-color: var(--board-light);
+  background-image: repeating-conic-gradient(
+    var(--board-dark) 0% 25%,
+    var(--board-light) 0% 50%
+  );
+  background-size: 25% 25%;
+}
+
+/*
+ * Legal destinations: a dot on an empty square, a ring on an occupied one.
+ *
+ * chessground draws both with a hard-stopped `radial-gradient`, which is the
+ * right technique — a real circle at an exact radius, no antialiasing budget
+ * spent on a shape that has to survive at 1/8 of a board. The geometry is kept
+ * exactly; only the colour changes, and the drop shadow chessground fakes with
+ * a third colour stop goes, because it was a black smear tuned for one board.
+ */
+cg-board square.move-dest {
+  background: radial-gradient(var(--board-mark) 22%, transparent 0);
+}
+
+cg-board square.oc.move-dest {
+  background: radial-gradient(transparent 0 79%, var(--board-mark) 79%);
+}
+
+cg-board square.move-dest:hover {
+  background: var(--board-selected);
+}
+
+cg-board square.last-move {
+  background-color: var(--board-last-move);
+}
+
+cg-board square.selected {
+  background-color: var(--board-selected);
+}
+
+/*
+ * The check glow. chessground's own radial gradient, with the palette's red in
+ * place of pure `#f00` and one stop fewer: the original fades red → red → two
+ * shades of transparent, which at these sizes is one stop doing nothing.
+ */
+cg-board square.check {
+  background: radial-gradient(
+    ellipse at center,
+    var(--board-check) 0%,
+    color-mix(in oklab, var(--board-check) 92%, transparent) 26%,
+    transparent 74%
+  );
+}
+
+/*
+ * Coordinates. The selector list is chessground's, verbatim, because it encodes
+ * which labels land on which colour of square for both orientations and there
+ * is no shorter way to say it. Ours is imported after theirs at equal
+ * specificity, so it wins.
+ */
+.orientation-white .ranks :nth-child(odd),
+.orientation-white .files :nth-child(even),
+.orientation-black .ranks :nth-child(even),
+.orientation-black .files :nth-child(odd),
+coords.squares:nth-of-type(odd) :nth-child(even),
+coords.squares:nth-of-type(even) :nth-child(odd) {
+  color: var(--board-coord-on-light);
+}
+
+.orientation-white .ranks :nth-child(even),
+.orientation-white .files :nth-child(odd),
+.orientation-black .ranks :nth-child(odd),
+.orientation-black .files :nth-child(even),
+coords.squares:nth-of-type(odd) :nth-child(odd),
+coords.squares:nth-of-type(even) :nth-child(even) {
+  color: var(--board-coord-on-dark);
+}
