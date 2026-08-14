@@ -1,7 +1,7 @@
 //! End-to-end checks over real positions: SEE on an actual board, the point-of-
 //! view flip of §3, and the classification that comes out of them.
 
-use kibitz_core::classify::{Classification, ClassifyInput, classify};
+use kibitz_core::classify::{Classification, ClassifyInput, EXCELLENT_DELTA, GREAT_GAP, classify};
 use kibitz_core::eval::Score;
 use kibitz_core::parse_fen;
 use kibitz_core::see::{see, see_square};
@@ -22,13 +22,15 @@ fn sq(name: &str) -> Square {
 }
 
 /// The Greek gift: Bxh7+ hands over a bishop for a pawn, and the engine still
-/// likes white. It is the only move that holds, so it is Great.
+/// likes white. Whether that is `Great` depends entirely on what declining would
+/// have cost — since `GREAT_GAP` became blunder-sized it takes a collapse, not
+/// an edge.
 ///
-/// The sacrifice itself is *not* part of that verdict: classification does not
-/// look at SEE at all (DESIGN §8.3). The material offer is still visible in
-/// `AnalysisContext`, which is where an explanation reads it from.
+/// The sacrifice itself is *not* part of the verdict either way: classification
+/// does not look at SEE at all (DESIGN §8.3). The material offer is still
+/// visible in `AnalysisContext`, which is where an explanation reads it from.
 #[test]
-fn greek_gift_is_great() {
+fn the_greek_gift_is_great_only_when_declining_collapses() {
     let fen = "r1bq1rk1/ppp1bppp/2n1pn2/3p4/3P4/2NBPN2/PPP2PPP/R1BQ1RK1 w - - 0 1";
     let (pos, bxh7) = play(fen, "d3h7");
     let after = pos.clone().play(bxh7).expect("legal");
@@ -38,16 +40,31 @@ fn greek_gift_is_great() {
     assert_eq!(after.turn(), shakmaty::Color::Black);
     assert!(see_square(&after, sq("h7")) < 0);
 
-    // Engine numbers: white keeps a small edge, everything else is worse.
-    let input = ClassifyInput {
+    // White keeps a small edge and the runner-up is merely worse: a 0.11 gap,
+    // which used to be enough and no longer is. This is the recalibration in
+    // §8.3, on a real board.
+    let edge = ClassifyInput {
         best: Score::Cp(60),
         second: Some(Score::Cp(-60)),
         played: Score::Cp(-55).negate(), // position N+1 is black to move
         played_rank: Some(0),
     };
-    let out = classify(&input);
+    let out = classify(&edge);
+    assert!(out.win_prob_before - edge.second.unwrap().win_prob() < GREAT_GAP);
+    assert_eq!(out.classification, Classification::Best);
+    // The Great guard, by the constant rather than a copy of its current value.
+    assert!(out.delta > EXCELLENT_DELTA, "delta = {}", out.delta);
+
+    // The version worth a "!": every other move hands the initiative back and
+    // loses the position outright, so the sacrifice really was the only move
+    // that held.
+    let collapse = ClassifyInput {
+        second: Some(Score::Cp(-400)),
+        ..edge
+    };
+    let out = classify(&collapse);
+    assert!(out.win_prob_before - collapse.second.unwrap().win_prob() >= GREAT_GAP);
     assert_eq!(out.classification, Classification::Great);
-    assert!(out.delta > -0.02, "delta = {}", out.delta);
 }
 
 /// Section 3, on a real board: the score of position N+1 belongs to the

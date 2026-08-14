@@ -1,8 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Chess } from 'chess.js';
 import { SAMPLE_PGN, SCRIPTED_MATES, SCRIPTED_MOVES } from './fixtures.ts';
 import { analysisFor, buildSession } from './engine.ts';
 import { mockFetch } from './mockServer.ts';
+import { analyze } from '../api/client.ts';
 import { expandSanLine } from '../chess/rules.ts';
 import { deepestOpening } from '../ui/opening.ts';
 import type { PositionAnalysis, SessionResponse } from '../api/types.ts';
@@ -59,6 +60,22 @@ describe('sample game fixture', () => {
     expect(deepestOpening(built.tree, 33)).toMatchObject({ name: 'Philidor Defense' });
   });
 
+  it('marks the opening moves as book, and stops two plies past the last name', () => {
+    // The server skips the engine for these, so they carry no candidates and
+    // placeholder win probabilities. Plies 6 and 7 are the interesting ones:
+    // book, but past the end of the name table.
+    for (let ply = 1; ply <= 7; ply++) {
+      const analysis = analysisFor(built.tree, ply)!;
+      expect(analysis.context?.played.classification, `ply ${ply}`).toBe('book');
+      expect(analysis.candidates, `ply ${ply}`).toHaveLength(0);
+      expect(analysis.context?.counterfactual).toBeNull();
+    }
+    // 4... Bxf3 leaves theory and is analysed like anything else.
+    const left = analysisFor(built.tree, 8)!;
+    expect(left.context?.played.classification).not.toBe('book');
+    expect(left.candidates.length).toBeGreaterThan(0);
+  });
+
   it('synthesises legal candidates for unscripted positions', () => {
     for (const node of built.tree.nodes) {
       const analysis = analysisFor(built.tree, node.id);
@@ -93,11 +110,34 @@ describe('mock server', () => {
     expect(tooEarly.status).toBe(409);
     expect(await tooEarly.json()).toEqual({ error: 'not analyzed' });
 
-    const analyzed = await mockFetch(`/api/sessions/${session.session_id}/analyze`, {
-      method: 'POST',
-      body: JSON.stringify({ node_id: 18, depth: 20 }),
-    });
-    const analysis = (await analyzed.json()) as PositionAnalysis;
+    // `/analyze` is SSE: rankings while the search runs, then the verdict.
+    const analyzeEvents: SseEvent[] = [];
+    await readSseStream(
+      await mockFetch(`/api/sessions/${session.session_id}/analyze`, {
+        method: 'POST',
+        body: JSON.stringify({ node_id: 18, depth: 20 }),
+      }),
+      (event) => analyzeEvents.push(event),
+    );
+
+    const partials = analyzeEvents.filter((event) => event.event === 'candidates');
+    expect(partials.length).toBeGreaterThan(1); // it really is streamed
+    expect(analyzeEvents.at(-1)!.event).toBe('analysis');
+
+    // The rule this endpoint exists to enforce: a partial is a ranking and
+    // nothing else, and its depth only ever climbs.
+    let previousDepth = 0;
+    for (const partial of partials) {
+      const payload = JSON.parse(partial.data) as Record<string, unknown>;
+      expect(Object.keys(payload).sort()).toEqual(['candidates', 'depth']);
+      expect(payload.depth as number).toBeGreaterThan(previousDepth);
+      previousDepth = payload.depth as number;
+      expect((payload.candidates as unknown[]).length).toBeGreaterThan(0);
+    }
+    // Nothing below the server's streaming floor is ever sent.
+    expect(JSON.parse(partials[0]!.data).depth).toBeGreaterThanOrEqual(6);
+
+    const analysis = JSON.parse(analyzeEvents.at(-1)!.data) as PositionAnalysis;
     expect(analysis.context?.played.classification).toBe('blunder');
     expect(analysis.context?.counterfactual?.pv[0]).toBe('Nxb5');
 
@@ -125,6 +165,46 @@ describe('mock server', () => {
 
     const unsupported = await mockFetch(`/api/sessions/${session.session_id}/explain/18?lang=zz`);
     expect(unsupported.status).toBe(400);
+  });
+
+  /**
+   * The mock's `/analyze` driven by the app's own client rather than by a raw
+   * reader — the combination `VITE_MOCK=1` actually runs.
+   *
+   * `client.ts` reaches the mock through `apiFetch`, which is `fetch` unless the
+   * build set `VITE_MOCK`, so stubbing the global is what puts the two halves
+   * together here: the mock's deliberately awkward chunking, the real SSE
+   * parser, and the real partial/final dispatch.
+   */
+  it('serves the app client a streamed analysis', async () => {
+    const created = await mockFetch('/api/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ pgn: SAMPLE_PGN }),
+    });
+    const session = (await created.json()) as SessionResponse;
+
+    vi.stubGlobal('fetch', ((input: RequestInfo | URL, init?: RequestInit) =>
+      mockFetch(input, init)) as typeof fetch);
+    try {
+      const seen: number[] = [];
+      const analysis = await analyze(
+        session.session_id,
+        { node_id: 18, depth: 12 },
+        { onCandidates: (event) => seen.push(event.depth) },
+      );
+      expect(seen.length).toBeGreaterThan(1);
+      expect([...seen].sort((a, b) => a - b)).toEqual(seen); // monotone
+      expect(seen[0]).toBeGreaterThanOrEqual(6);
+      expect(analysis.context?.played.classification).toBe('blunder');
+
+      // An unknown node is a status, not an event — the client must reject
+      // rather than wait for a stream that will never open.
+      await expect(
+        analyze(session.session_id, { node_id: 999, depth: 12 }),
+      ).rejects.toThrow('node not found');
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it('rejects an illegal move and auto-merges a repeated one', async () => {

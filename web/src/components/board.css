@@ -21,6 +21,87 @@
 }
 
 /**
+ * Chessground's piece images, borrowed away from the board.
+ *
+ * Two places in the app draw a chess piece outside the board — the promotion
+ * picker and the captured-piece rows in `PlayerStrip` — and both do it by
+ * putting a `<piece>` inside something classed `cg-wrap`, because that is the
+ * selector chessground's piece sheet is written against
+ * (`.cg-wrap piece.pawn.black`). It is the only way to reuse those embedded
+ * SVGs without a second copy of the artwork in this repository, drifting.
+ *
+ * The class carries three assumptions with it that do not travel: that the
+ * element *is* the board, that it therefore fills its parent, and that it is a
+ * block. `cg-inline` says none of those. Sizing then comes from the box each
+ * piece is put in, which is what the callers already do — the picker's tiles are
+ * 12.5% of the board, the strips' are a line of text tall.
+ *
+ * The `display` is spelled out here rather than left to a `flex` utility on the
+ * element, because `.cg-wrap` and `.flex` have the same specificity and which
+ * one wins is then a question about stylesheet order — a laid-out row silently
+ * became a stack of one group per line the first time this was tried.
+ */
+.cg-wrap.cg-inline {
+  width: auto;
+  height: auto;
+  display: flex;
+  align-items: center;
+}
+
+/**
+ * The captured-piece tallies, flattened to silhouettes.
+ *
+ * cburnett's pieces are drawn to be told apart *on a board*: a white piece is a
+ * white fill inside a black outline, a black piece is a black fill inside the
+ * same black outline. That is exactly the right drawing for eight ranks of two
+ * armies and exactly the wrong one for a caption. On the dark theme's near-black
+ * strip the black pieces disappear outright — nothing but their own outline is
+ * left, on a background the same colour as their fill — and the light theme
+ * fails the same way with the colours exchanged, the white ones surviving only
+ * on their outline.
+ *
+ * The colour was never carrying information here anyway. A captured-piece row
+ * sits in one player's strip and holds what *that* player took, so every piece
+ * in it is the opposite colour by construction: the row above the board is one
+ * army and the row below is the other, and no one has ever had to check. So the
+ * pieces stop being board pieces and become a tally — one flat silhouette in the
+ * theme's own ink, which is what every large chess site draws in this spot.
+ *
+ * **A filter, because there is no fill to set.** These images are not inline SVG
+ * we own; they are base64 `background-image`s inside chessground's stylesheet
+ * (`.cg-wrap piece.pawn.black { background-image: url('data:image/svg+xml,…') }`)
+ * and the whole point of borrowing them is not keeping a second copy of the
+ * artwork here. A background image has no `fill` and no `currentColor` — its
+ * colours are sealed inside the data URI — so the only place left to recolour it
+ * is after it has been rasterised. `brightness(0)` multiplies every channel by
+ * zero and leaves alpha alone: whatever the artwork was, opaque pixels come out
+ * black, transparent pixels stay transparent, and the antialiased edges keep
+ * their fractional coverage. That single declaration collapses white fill, black
+ * fill and black outline into one shape. `invert(1)` then turns that black
+ * silhouette white for the dark theme.
+ *
+ * The opacity is the last stage rather than a separate `opacity` property so the
+ * whole treatment stays in one value that a theme can replace wholesale. Its two
+ * numbers are chosen to land the silhouette on roughly `--muted-foreground`
+ * against each theme's `--background` — black at 62% over `oklch(0.985 …)` and
+ * white at 58% over `oklch(0.16 …)` both come out near L 0.52 / L 0.71. Muted,
+ * deliberately: this is a running total sitting a few pixels from the board, and
+ * a tally drawn at full contrast competes with the position for attention.
+ *
+ * Scoped to `.cg-captured` and not to `.cg-inline`, because the other borrower
+ * of these images is `PromotionPicker`, where the piece's colour is the entire
+ * message — you are choosing between a white queen and a black one — and a
+ * silhouette there would be a bug.
+ */
+.cg-wrap.cg-captured piece {
+  filter: brightness(0) opacity(0.62);
+}
+
+:root[data-theme='dark'] .cg-wrap.cg-captured piece {
+  filter: brightness(0) invert(1) opacity(0.58);
+}
+
+/**
  * A captured piece is replaced, not dissolved.
  *
  * chessground marks a piece that is about to disappear `.fading` and gives it
@@ -210,4 +291,26 @@ coords.squares:nth-of-type(even) :nth-child(odd) {
 coords.squares:nth-of-type(odd) :nth-child(odd),
 coords.squares:nth-of-type(even) :nth-child(even) {
   color: var(--board-coord-on-dark);
+}
+
+/**
+ * Arrows are drawn over the pieces, not under them.
+ *
+ * chessground stacks the board as: pieces at `z-index: 2`, the arrow layer
+ * (`.cg-shapes`) also at 2 but later in the DOM, an animating piece at 8, and a
+ * piece being dragged at 11. So at rest the arrows already win on document
+ * order — but a piece in mid-slide does not, and for the 180ms of a navigation
+ * step or the 420ms of a replay move the piece that is moving covers the arrow
+ * that is about to explain it. (`addPieceZIndex` made this far worse by giving
+ * every piece a rank-derived index of 2..9; it is switched off in `Board.tsx`
+ * and the comment there says why.)
+ *
+ * 10 is the answer rather than something larger: above every piece the board
+ * draws by itself, and deliberately still below `piece.dragging` at 11. A piece
+ * the user is holding under the cursor is the one thing that should be on top
+ * of everything — it is in their hand, and an arrow drawn over it would read as
+ * the board arguing with the drag.
+ */
+.cg-wrap .cg-shapes {
+  z-index: 10;
 }

@@ -96,7 +96,12 @@ export function Board({
       fen,
       orientation,
       coordinates: true,
-      addPieceZIndex: true,
+      // Off, and it has to be: it stamps every piece with an inline `z-index`
+      // derived from its rank (2 at the back, 9 at the front) so that a 3D piece
+      // set overlaps correctly down the board. With a flat set it buys nothing —
+      // and chessground's arrow layer sits at `z-index: 2`, so every piece from
+      // the second rank up was painting over the arrows.
+      addPieceZIndex: false,
       highlight: { lastMove: true, check: true },
       animation: { enabled: true, duration: animationMs },
       movable: {

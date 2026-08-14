@@ -126,14 +126,23 @@ querying the moment a game leaves book; please keep it that way.
 **The Opening Explorer is currently unavailable.** Every endpoint has returned
 `401` since an outage that began on 2026-02-23
 ([lichess-org/lila#19610](https://github.com/lichess-org/lila/issues/19610), still
-open). kibitz treats that as "no book": it stops asking for an hour and analyses
-the game normally, so opening moves get classified on evaluation alone rather than
-being recognised as theory.
+open). kibitz stops asking for an hour and falls back to the ECO table embedded in
+the binary, which recognises a move as theory while the line it belongs to is still
+being followed — typically the first four to ten plies of a club game. The Explorer
+stays authoritative whenever it answers: its game counts say how often a move was
+actually played, which an ECO table cannot. See §9.3 of
+[docs/DESIGN.md](docs/DESIGN.md) for what the offline mark can and cannot claim.
 
-Move classification thresholds follow Lichess (`lila`'s `Advice.scala`).
-Great and Miss do not exist there — those are defined in
-[`crates/core/src/classify.rs`](crates/core/src/classify.rs) and need tuning
-against real games.
+Move classification thresholds started from Lichess (`lila`'s `Advice.scala`).
+Blunder and Mistake still match it. Inaccuracy and Excellent no longer do:
+they were recalibrated to -0.07 and -0.03 against 40 rated games between
+1200-1600 players, because Lichess's -0.10 and -0.02 left `Good` covering 29% of
+a club player's moves — everything from imperceptible to clearly bad under one
+label. Great and Miss do not exist in Lichess at all; Great's "only move" gap was
+recalibrated against the same games, from 0.10 to 0.30, after it turned out to
+fire on 6.3% of all moves — five a game. All of it lives in
+[`crates/core/src/classify.rs`](crates/core/src/classify.rs), with the
+measurements behind each number; see §8.3 of [docs/DESIGN.md](docs/DESIGN.md).
 
 ## License
 

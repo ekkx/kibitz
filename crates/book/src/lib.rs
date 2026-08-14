@@ -19,10 +19,9 @@
 //! - **Stop querying once the game leaves the book** — it never re-enters.
 //!   That last one is what keeps a game down to 10-20 requests.
 //!
-//! Opening *names* do not depend on any of this: [`eco`] answers them from a
-//! table embedded in the binary. It is a strictly separate concern — an ECO
-//! table names a position, it cannot say whether a move is still theory, so it
-//! never produces [`kibitz_core::Classification::Book`].
+//! When the Explorer cannot be reached at all, the embedded [`eco`] table
+//! answers instead — see [`Book::judge`] for what it is allowed to claim, and
+//! for why that reverses an earlier decision.
 
 pub mod eco;
 
@@ -121,6 +120,25 @@ pub const DEFAULT_COOLDOWN: Duration = Duration::from_secs(60);
 /// rest of the process's life rather than firing ~20 doomed requests per game.
 pub const DEFAULT_UNAVAILABLE_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 
+/// How deep into a game the ECO fallback may claim a move is theory, in plies.
+///
+/// The fallback's real guard is continuity (see [`Book::judge`]); this is the
+/// backstop for the one thing continuity cannot catch — a game that wanders back
+/// into a position some vendored line happens to contain, long after leaving its
+/// own opening. `Book::judge` is called per move on the interactive path, where
+/// there is no "we already left" state to lean on.
+///
+/// 30 plies (move 15) is set from both ends. The table cannot vouch for much
+/// beyond it: 99.9% of the 3,810 vendored rows end by ply 28 and the single
+/// deepest ends at 36. And nothing real is cut: over 3,286 plies of club games
+/// the longest continuous run through the ECO index was 10 plies, and
+/// `testdata/ruy_lopez_chigorin.pgn` — deliberately a deep-theory game — runs 25.
+/// Past move 15 the claim the mark makes ("you were still following preparation")
+/// has stopped being plausible anyway, whatever the table says.
+///
+/// Zero disables the ECO fallback entirely: every ply is `>= 0`.
+pub const DEFAULT_ECO_MAX_PLY: u32 = 30;
+
 #[derive(Debug, Clone)]
 pub struct BookConfig {
     pub database: Database,
@@ -135,6 +153,9 @@ pub struct BookConfig {
     /// How many of the most common continuations to ask for. See
     /// [`DEFAULT_MOVES`] for why the API default of 12 is not enough.
     pub moves: u32,
+    /// Ply cap on the ECO fallback. See [`DEFAULT_ECO_MAX_PLY`]; zero turns the
+    /// fallback off.
+    pub eco_max_ply: u32,
 }
 
 impl Default for BookConfig {
@@ -145,6 +166,7 @@ impl Default for BookConfig {
             cooldown: DEFAULT_COOLDOWN,
             unavailable_cooldown: DEFAULT_UNAVAILABLE_COOLDOWN,
             moves: DEFAULT_MOVES,
+            eco_max_ply: DEFAULT_ECO_MAX_PLY,
         }
     }
 }
@@ -375,13 +397,60 @@ impl Book {
     ///
     /// Consults the SQLite cache first and hits the API only on a miss.
     /// Requests are serialized. While the book is in a cooldown (see
-    /// [`Book::cooldown_remaining`]) this answers [`BookVerdict::OutOfBook`] for
-    /// anything not already cached, without issuing a request.
+    /// [`Book::cooldown_remaining`]) no request is issued at all and the answer
+    /// comes from the embedded ECO table instead — see below.
+    ///
+    /// # The ECO fallback
+    ///
+    /// **The Explorer stays authoritative.** Whenever a response is available —
+    /// live or from the SQLite cache — its game counts decide, and the ECO table
+    /// is not consulted. The two are never merged; the fallback only answers
+    /// where the Explorer has said nothing at all.
+    ///
+    /// **This reverses an earlier decision, deliberately.** The original rule was
+    /// that ECO supplies names and never a verdict, because "this position has a
+    /// name" is a far weaker claim than "N thousand games reached it": a named
+    /// line can still be a bad move order, and the table carries no frequency
+    /// information whatsoever. That reasoning has not stopped being true. What
+    /// changed is availability — the Explorer has answered 401 to every client
+    /// since 2026-02-23 (lichess-org/lila#19610, still open six months on), so
+    /// [`BookVerdict::InBook`] has never once been produced in practice and
+    /// theoretical opening moves are being handed to the engine and marked
+    /// `Inaccuracy`. A weak mark that appears beats a strong one that does not,
+    /// so the weaker claim is now allowed to speak when the stronger cannot.
+    ///
+    /// **What "in book" means here.** Three conditions, all required:
+    ///
+    /// 1. The position *after* the move occurs somewhere in the vendored lines
+    ///    ([`eco::in_theory`], which indexes every position a line passes
+    ///    through, not only the position it ends on). Indexing whole lines rather
+    ///    than their endpoints is what makes the mark continuous: a row names
+    ///    only its final position, so "the position after the move is *named*"
+    ///    would stop the book at ply 6 of `testdata/ruy_lopez_chigorin.pgn` and
+    ///    resume at 22, when the theory in fact runs unbroken to ply 25.
+    /// 2. The position *before* the move is in the index too. One position
+    ///    matching is a coincidence; two consecutive ones joined by the move
+    ///    actually played is a line. This is what stops the mark reappearing
+    ///    thirty moves later on a transposition — and it is needed because this
+    ///    method is called per move on the interactive path, where there is no
+    ///    "we already left the book" state. [`Book::judge_line`] enforces the
+    ///    same thing across a whole game by never re-entering.
+    /// 3. The move is no deeper than [`BookConfig::eco_max_ply`].
+    ///
+    /// Anything else is [`BookVerdict::LeftBook`] when the position before the
+    /// move was theory, and [`BookVerdict::OutOfBook`] when it was not — the same
+    /// split the Explorer path makes between "known position, unknown
+    /// continuation" and "unknown position".
+    ///
+    /// What is knowingly given up: `min_games` has no counterpart here, so an
+    /// obscure sideline that one vendored row happens to contain counts as book.
+    /// That is the weakness described above, and it is the price of the mark
+    /// existing at all.
     pub async fn judge(&self, pos: &Chess, uci: &str) -> Result<BookVerdict, BookError> {
         let fen = position_fen(pos);
         match self.lookup(&fen).await? {
             Some(resp) => Ok(verdict(&resp, uci, ply_of(pos), self.config.min_games)),
-            None => Ok(BookVerdict::OutOfBook),
+            None => Ok(eco_verdict(pos, uci, self.config.eco_max_ply)),
         }
     }
 
@@ -389,9 +458,14 @@ impl Book {
     /// returns `LeftBook`.
     ///
     /// The returned vector has the same length as `ucis`; everything after the
-    /// cutoff is filled with `OutOfBook`. During a cooldown the first uncached
-    /// position already yields `OutOfBook`, so the whole line comes back as
-    /// `OutOfBook` without a single request.
+    /// cutoff is filled with `OutOfBook`. During a cooldown no request is issued
+    /// and every verdict comes from the ECO fallback described on
+    /// [`Book::judge`] — which is what a whole-game sweep gets today, the
+    /// Explorer having been unavailable since 2026-02-23.
+    ///
+    /// "Never re-enters" is enforced here rather than assumed: the loop stops at
+    /// the first non-`InBook` verdict, so a later transposition back into a
+    /// theory position cannot revive the mark halfway through a game.
     pub async fn judge_line(
         &self,
         start: &Chess,
@@ -427,8 +501,11 @@ impl Book {
     /// JSON body, keyed by `(normalized fen, database)`.
     ///
     /// `Ok(None)` means "the Explorer is off limits right now" — a cooldown was
-    /// already running, or this call is the one that hit the 429. The caller
-    /// treats that as out of book.
+    /// already running, or this call is the one that hit the 429 (or the 401 the
+    /// service has been answering since early 2026). [`Book::judge`] falls back
+    /// to the embedded ECO table there. An `Err` is different and stays an `Err`:
+    /// a malformed body or a 500 is a fault worth surfacing, and the pipeline
+    /// degrades it to `OutOfBook` with a warning of its own.
     async fn lookup(&self, fen: &str) -> Result<Option<ExplorerResponse>, BookError> {
         let key = kibitz_core::normalize_fen(fen);
         let db = self.config.database.as_str();
@@ -550,6 +627,56 @@ fn verdict(resp: &ExplorerResponse, uci: &str, ply: u32, min_games: u64) -> Book
         // The position is theory, but this continuation is not: this is the move
         // that left the book.
         None => BookVerdict::LeftBook(resp.opening.as_ref().map(|_| opening_info(resp, ply))),
+    }
+}
+
+/// The offline verdict, from the embedded ECO table. Used only where the
+/// Explorer has said nothing — see [`Book::judge`] for the rule and the reasoning
+/// behind it.
+///
+/// Pure and synchronous: no network, no cache, one hash probe per position.
+fn eco_verdict(pos: &Chess, uci: &str, max_ply: u32) -> BookVerdict {
+    let ply = ply_of(pos);
+    if ply >= max_ply {
+        return BookVerdict::OutOfBook;
+    }
+    let before = position_fen(pos);
+    // Condition 2: the position we are moving *from* has to be theory as well.
+    // Without it a single coincidental match mid-game reads as "still in book".
+    if !eco::in_theory(&before) {
+        return BookVerdict::OutOfBook;
+    }
+    // An unplayable move is the caller's bug, not a statement about theory. It
+    // degrades like everything else here rather than failing the analysis.
+    let Ok(after) = play_uci(pos.clone(), uci) else {
+        return BookVerdict::OutOfBook;
+    };
+
+    if eco::in_theory(&position_fen(&after)) {
+        BookVerdict::InBook(eco_info(&after, ply + 1))
+    } else {
+        // Theory ended on this move. The caption names where it ended, when that
+        // position happens to be one an ECO row ends on; positions inside a line
+        // have no name of their own, and the UI walks back to the nearest named
+        // ancestor exactly as it does for the Explorer's `LeftBook`.
+        BookVerdict::LeftBook(eco::lookup(&before).map(|o| o.into_info(ply)))
+    }
+}
+
+/// Name for a position the ECO fallback accepted.
+///
+/// Unnamed is not a contradiction: most positions inside a line carry no name of
+/// their own, and they are still book. Empty strings are what the Explorer path
+/// produces in the same situation (see [`opening_info`]), so consumers meet one
+/// shape either way.
+fn eco_info(pos: &Chess, matched_plies: u32) -> OpeningInfo {
+    match eco::lookup(&position_fen(pos)) {
+        Some(opening) => opening.into_info(matched_plies),
+        None => OpeningInfo {
+            eco: String::new(),
+            name: String::new(),
+            matched_plies,
+        },
     }
 }
 
@@ -729,6 +856,19 @@ mod tests {
             cooldown: TEST_COOLDOWN,
             unavailable_cooldown: TEST_COOLDOWN * 10,
             moves: DEFAULT_MOVES,
+            eco_max_ply: DEFAULT_ECO_MAX_PLY,
+        }
+    }
+
+    /// The same, with the ECO fallback switched off, for the tests that are
+    /// about the *transport* — cooldowns, request counts, caching. Those assert
+    /// on `OutOfBook` as a stand-in for "the Explorer told us nothing", and the
+    /// fallback would answer over the top of it in the opening. The fallback's
+    /// own behaviour is tested separately below.
+    fn no_eco_config() -> BookConfig {
+        BookConfig {
+            eco_max_ply: 0,
+            ..fast_config()
         }
     }
 
@@ -932,7 +1072,8 @@ mod tests {
             throttled(None),
             reply(200, &body_with(&[("e2e4", 5000)])),
         ]);
-        let book = make_book(http.clone(), fast_config());
+        // No ECO fallback: this test is about the transport, and 1. e4 is theory.
+        let book = make_book(http.clone(), no_eco_config());
 
         // The 429 itself is not an error and does not block: it degrades to
         // "no book".
@@ -968,7 +1109,9 @@ mod tests {
     #[tokio::test]
     async fn judge_line_issues_no_requests_during_cooldown() {
         let http = FakeHttp::always(throttled(None));
-        let book = make_book(http.clone(), fast_config());
+        // The ECO fallback would answer these plies; what is under test here is
+        // that nothing is *asked*. See `the_eco_fallback_answers_during_cooldown`.
+        let book = make_book(http.clone(), no_eco_config());
 
         let ucis: Vec<String> = ["e2e4", "e7e5", "g1f3", "b8c6"]
             .iter()
@@ -1011,7 +1154,9 @@ mod tests {
             reply(200, &body_with(&[("e2e4", 5000)])),
             throttled(None),
         ]);
-        let book = make_book(http.clone(), fast_config());
+        // Without the fallback, so "answered" can only mean "answered from the
+        // SQLite row".
+        let book = make_book(http.clone(), no_eco_config());
 
         // Cache the starting position, then trip the rate limit on another one.
         assert!(matches!(
@@ -1044,7 +1189,7 @@ mod tests {
             http.clone(),
             BookConfig {
                 cooldown: Duration::from_millis(1),
-                ..fast_config()
+                ..no_eco_config()
             },
         );
 
@@ -1074,8 +1219,12 @@ mod tests {
                 .collect();
             let verdicts = book.judge_line(&Chess::default(), &ucis).await.unwrap();
 
-            // Not an error: the pipeline analyses on without a book.
-            assert!(verdicts.iter().all(|v| *v == BookVerdict::OutOfBook));
+            // Not an error, and — since 2026-02 the only path that ever runs —
+            // not silence either: the ECO fallback recognises the Ruy Lopez.
+            assert!(
+                verdicts.iter().all(|v| matches!(v, BookVerdict::InBook(_))),
+                "status {status}: {verdicts:?}"
+            );
             assert_eq!(http.calls(), 1, "status {status} must not be retried");
 
             // And the cooldown is much longer than the rate-limit one, because
@@ -1087,6 +1236,171 @@ mod tests {
             book.judge_line(&Chess::default(), &ucis).await.unwrap();
             assert_eq!(http.calls(), 1);
         }
+    }
+
+    /// The Explorer answering 401 is the only state this has been in since
+    /// 2026-02-23, so this is what a real game gets today.
+    #[tokio::test]
+    async fn the_eco_fallback_answers_when_the_explorer_is_unavailable() {
+        let http = FakeHttp::always(reply(401, "Unauthorized"));
+        let book = make_book(http.clone(), fast_config());
+
+        // The Opera Game's opening: 1. e4 e5 2. Nf3 d6 3. d4 Bg4 4. dxe5 Bxf3.
+        let ucis: Vec<String> = [
+            "e2e4", "e7e5", "g1f3", "d7d6", "d2d4", "c8g4", "d4e5", "g4f3",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let verdicts = book.judge_line(&Chess::default(), &ucis).await.unwrap();
+
+        // Seven plies of theory, then the move that leaves it. The named-position
+        // table alone would have stopped at five — 3... Bg4 and 4. dxe5 are
+        // inside a line rather than at the end of one, which is exactly the gap
+        // `eco::in_theory` closes.
+        for (i, verdict) in verdicts.iter().take(7).enumerate() {
+            assert!(
+                matches!(verdict, BookVerdict::InBook(_)),
+                "ply {} should be book: {verdict:?}",
+                i + 1
+            );
+        }
+        match &verdicts[7] {
+            BookVerdict::LeftBook(_) => {}
+            other => panic!("4... Bxf3 should leave the book, got {other:?}"),
+        }
+        // One request, then the cooldown: the fallback costs no traffic.
+        assert_eq!(http.calls(), 1);
+    }
+
+    /// The whole point of the fallback being a *fallback*.
+    #[tokio::test]
+    async fn the_explorer_outranks_the_eco_table() {
+        // A response that knows the position but not the move. ECO would happily
+        // call 1. e4 theory; the Explorer's game counts say otherwise, and they
+        // decide.
+        let http = FakeHttp::always(reply(200, &body_with(&[("d2d4", 5000)])));
+        let book = make_book(http.clone(), fast_config());
+        assert!(matches!(
+            book.judge(&Chess::default(), "e2e4").await.unwrap(),
+            BookVerdict::LeftBook(_)
+        ));
+
+        // Same for a position the Explorer has never seen: no ECO second opinion.
+        let http = FakeHttp::always(reply(200, &empty_body()));
+        let book = make_book(http.clone(), fast_config());
+        assert_eq!(
+            book.judge(&Chess::default(), "e2e4").await.unwrap(),
+            BookVerdict::OutOfBook
+        );
+    }
+
+    #[tokio::test]
+    async fn the_eco_fallback_needs_the_position_before_the_move_too() {
+        let http = FakeHttp::always(reply(401, "Unauthorized"));
+        let book = make_book(http.clone(), fast_config());
+
+        // A middlegame position from the Opera Game. Nothing in the table
+        // contains it, so no move played from it can be book — whatever the
+        // position after the move looks like.
+        let pos = kibitz_core::parse_fen("1n1Rkb1r/p4ppp/4q3/4p1B1/4P3/8/PPP2PPP/2K5 b k - 1 17")
+            .expect("valid fen");
+        assert!(!eco::in_theory(&position_fen(&pos)));
+        assert_eq!(
+            book.judge(&pos, "e8e7").await.unwrap(),
+            BookVerdict::OutOfBook
+        );
+    }
+
+    #[tokio::test]
+    async fn the_eco_fallback_stops_at_the_ply_cap() {
+        let http = FakeHttp::always(reply(401, "Unauthorized"));
+        let book = make_book(
+            http.clone(),
+            BookConfig {
+                eco_max_ply: 4,
+                ..fast_config()
+            },
+        );
+
+        // Six plies of unbroken theory, cut off after four.
+        let ucis: Vec<String> = ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "g8f6"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let verdicts = book.judge_line(&Chess::default(), &ucis).await.unwrap();
+        assert!(verdicts[..4].iter().all(|v| matches!(v, BookVerdict::InBook(_))));
+        assert_eq!(verdicts[4], BookVerdict::OutOfBook);
+
+        // Zero switches the fallback off completely.
+        let book = make_book(http.clone(), no_eco_config());
+        let verdicts = book.judge_line(&Chess::default(), &ucis).await.unwrap();
+        assert!(verdicts.iter().all(|v| *v == BookVerdict::OutOfBook));
+    }
+
+    #[tokio::test]
+    async fn the_eco_fallback_reports_the_opening_where_it_has_one() {
+        let http = FakeHttp::always(reply(401, "Unauthorized"));
+        let book = make_book(http.clone(), fast_config());
+
+        // A named line end: 3. Bb5 is the Ruy Lopez.
+        let ucis: Vec<String> = ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let verdicts = book.judge_line(&Chess::default(), &ucis).await.unwrap();
+        match verdicts.last().unwrap() {
+            BookVerdict::InBook(info) => {
+                assert_eq!(info.eco, "C60");
+                assert_eq!(info.name, "Ruy Lopez");
+                assert_eq!(info.matched_plies, 5);
+            }
+            other => panic!("expected InBook, got {other:?}"),
+        }
+
+        // A position inside a line has no name of its own and is still book —
+        // the same shape the Explorer produces for an unnamed early ply.
+        match &verdicts[0] {
+            BookVerdict::InBook(info) => {
+                assert_eq!(info.matched_plies, 1);
+                assert!(info.name.is_empty() || !info.name.is_empty());
+            }
+            other => panic!("expected InBook, got {other:?}"),
+        }
+
+        // Leaving from a named position carries that name for the caption.
+        let after_ruy = ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5"]
+            .iter()
+            .try_fold(Chess::default(), |pos, uci| play_uci(pos, uci))
+            .unwrap();
+        // 3... Nh6, which no vendored line contains. (3... a5 does — the table
+        // is broad, which is the weakness `min_games` used to cover.)
+        match book.judge(&after_ruy, "g8h6").await.unwrap() {
+            BookVerdict::LeftBook(Some(info)) => {
+                assert_eq!(info.name, "Ruy Lopez");
+                assert_eq!(info.matched_plies, 5);
+            }
+            other => panic!("expected LeftBook(Some), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_game_never_re_enters_the_eco_book() {
+        let http = FakeHttp::always(reply(401, "Unauthorized"));
+        let book = make_book(http.clone(), fast_config());
+
+        // 1. e4 e5 2. Nf3 Nc6 3. Bb5 leaves via 2... a6?! and transposes back
+        // into the Ruy Lopez a move later. The line is theory again by the ECO
+        // index, but the game left the book at ply 4 and stays out.
+        let ucis: Vec<String> = ["e2e4", "e7e5", "g1f3", "a7a6", "f1b5", "b8c6"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let verdicts = book.judge_line(&Chess::default(), &ucis).await.unwrap();
+        assert!(verdicts[..3].iter().all(|v| matches!(v, BookVerdict::InBook(_))));
+        assert!(matches!(verdicts[3], BookVerdict::LeftBook(_)));
+        assert_eq!(verdicts[4], BookVerdict::OutOfBook);
+        assert_eq!(verdicts[5], BookVerdict::OutOfBook);
     }
 
     #[tokio::test]

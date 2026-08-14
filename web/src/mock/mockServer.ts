@@ -18,7 +18,7 @@ import {
   genericExplanation,
   type ScriptedMove,
 } from './fixtures.ts';
-import { analysisFor, buildSession, mainlineIds, playOnTree } from './engine.ts';
+import { analysisFor, buildSession, mainlineIds, playOnTree, streamedDepths } from './engine.ts';
 import type { GameTree } from '../api/types.ts';
 
 interface MockSession {
@@ -188,13 +188,41 @@ export async function mockFetch(
     return json({ ...played, tree: session.tree });
   }
 
+  /*
+    `/analyze` is SSE: the ranking as the search deepens, then the finished
+    analysis. Two things about this route are load-bearing for the app's tests.
+
+    The 404 is decided *before* the stream opens, exactly as the Rust server
+    decides it — once a body has started there is no status left to send, and a
+    client that only handled in-stream errors would hang on an unknown node.
+
+    And the verdict is only ever in the `analysis` event. `candidates` carries a
+    depth and a ranking; adding a classification to it here would make mock mode
+    disagree with the server about the one rule this endpoint has.
+  */
   if (sub === '/analyze' && method === 'POST') {
-    await sleep(320);
     const nodeId = body.node_id as number;
     const analysis = analysisFor(session.tree, nodeId, cachedExplanations(session, nodeId));
     if (!analysis) return fail(404, 'node not found');
-    session.analysed.add(nodeId);
-    return json(analysis);
+
+    return sseResponse(async function* () {
+      let elapsed = 0;
+      for (const step of streamedDepths(analysis.candidates)) {
+        if (signal?.aborted) return;
+        await sleep(step.at - elapsed);
+        elapsed = step.at;
+        yield sseEvent('candidates', { depth: step.depth, candidates: step.candidates });
+      }
+      // The gap between the last iteration and the verdict is the *second*
+      // search — the parent's, which the server runs only to classify the move
+      // that was played. It is the whole reason the split is worth making, so
+      // the mock waits it out rather than pretending the two arrive together.
+      await sleep(340 - elapsed);
+      if (signal?.aborted) return;
+      session.analysed.add(nodeId);
+      storeAnalysis(session, nodeId, analysis);
+      yield sseEvent('analysis', analysis);
+    }, signal);
   }
 
   if (sub === '/analyze-game' && method === 'POST') {

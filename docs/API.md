@@ -80,9 +80,12 @@ interface Node {
   fen: string;
   analysis: PositionAnalysis | null;
   // The named opening this position belongs to, from an ECO table embedded in
-  // the binary. Offline, always present, and **display only** — it never makes
-  // a move `Classification::Book`. Deciding whether a move is still theory needs
-  // the Opening Explorer's game counts, which an ECO table does not carry.
+  // the binary. Offline, always present, and **display only** — a name is not a
+  // verdict. Whether the move is still theory is decided separately (the
+  // Opening Explorer's game counts, or the same ECO table read as a set of
+  // lines when the Explorer is down — DESIGN §9.3), and the two do not line up
+  // move for move: most book moves have no name of their own, and a position
+  // can be named long after the game left theory.
   opening: OpeningInfo | null;
 }
 
@@ -159,42 +162,116 @@ Play a move on the board. An existing child with the same move is returned as-is
 
 An illegal move is `400 { "error": "illegal move" }`.
 
-### `POST /api/sessions/{id}/analyze`
+### `POST /api/sessions/{id}/analyze` (SSE)
 
-Analyse one node. A newer `analyze` cancels the running one; the older request
-then returns `409 { "error": "cancelled" }`. This is "latest only", and it is
-what makes rapidly trying moves on the board feel immediate.
+Analyse one node, streaming the ranking as the search deepens. `text/event-stream`.
 
 `depth` is optional and defaults to 12.
-
-`candidates` is ordered best first and holds **up to 5** moves (fewer only when
-the position has fewer legal moves). The width is fixed server-side and is not a
-request parameter: it is part of the analysis cache key, so making it negotiable
-would silently re-analyse an already-analysed game whenever a client changed it.
-A client that draws fewer arrows should take the first *n* candidates.
-
-**A running `analyze-game` is not affected.** The server arbitrates the one
-engine process, so an `analyze` issued during a sweep waits for the sweep's
-current position rather than cancelling the run — and a node the sweep has
-already reached is served from cache without waiting at all. Cancellation now
-only ever happens between two `analyze` requests; clients do not need to
-serialise engine requests themselves.
 
 ```jsonc
 // body
 { "node_id": 13, "depth": 12 }   // depth optional, defaults to 12
 ```
 
-```jsonc
-// 200 — PositionAnalysis
-{ "fen": "...", "depth": 12, "candidates": [...], "context": {...} | null, "explanations": {} }
 ```
+event: candidates
+data: {"depth":6,"candidates":[...]}
+
+event: candidates
+data: {"depth":8,"candidates":[...]}
+
+event: analysis
+data: { ...PositionAnalysis... }
+
+event: error
+data: {"error":"..."}
+```
+
+#### The two events, and the line between them
+
+**`candidates` is a ranking. `analysis` is a judgement.** That distinction is the
+whole design of this endpoint and a client must not blur it.
+
+A `candidates` event carries `depth` and the `Candidate[]` for that completed
+iteration — best first, the same shape and ordering as `PositionAnalysis.candidates`.
+It carries **nothing else**: no `classification`, no `accuracy`, no `delta`, no
+`counterfactual`, no `context`. A ranking is the same kind of claim at every
+depth and simply gets sharper, so it is safe to draw immediately and redraw as it
+improves — that is what the board's arrows, the candidate list and the eval bar
+are made of.
+
+A classification is a different kind of claim: it comes from *comparing* two
+searches against fixed thresholds, and thresholds have no notion of "roughly". A
+move can read `Blunder` at depth 6 and `Good` at depth 12. So the verdict is
+emitted exactly once, on the final `analysis` event, at the depth it was
+calibrated at. **Clients must not render a classification, accuracy or
+counterfactual before `analysis` arrives**, and must not derive one from a
+partial.
+
+`analysis` carries the complete `PositionAnalysis` — byte for byte the JSON body
+this route used to return. A client that ignores `candidates` entirely still gets
+exactly the old behaviour.
+
+#### Other guarantees
+
+- `candidates` events are **monotone in `depth`** and arrive once per depth.
+- Depths below **6** are never sent. Everything under it lands within a few
+  milliseconds of the search starting and is the part most likely to be
+  withdrawn; see `MIN_STREAM_DEPTH` in `crates/engine/src/lib.rs` for the
+  measurements behind the number.
+- `candidates` is ordered best first and holds **up to 5** moves (fewer only when
+  the position has fewer legal moves). The width is fixed server-side and is not a
+  request parameter: it is part of the analysis cache key, so making it negotiable
+  would silently re-analyse an already-analysed game whenever a client changed it.
+  A client that draws fewer arrows should take the first *n* candidates.
+- **A cached or terminal position sends no `candidates` at all** — just
+  `analysis`. There was no search, so there is nothing to narrate, and the result
+  should snap into place rather than pretend to think.
+- Only the finished analysis is stored on the session tree. A partial is never
+  visible to `GET /api/sessions/{id}`.
+
+#### Cancellation, and its two shapes
+
+A newer `analyze` cancels the running one — "latest only", unchanged, and it is
+what makes rapidly trying moves on the board feel immediate. What changed is how
+the older request hears about it.
+
+Failures the server can decide **before the response begins** are still an HTTP
+status with the usual `{"error": ...}` body: `404 session not found`,
+`404 node not found`, `503 engine unavailable`, `400` for a malformed body.
+
+Once the stream is open the status line has already gone out as `200`, so
+anything that fails **during** the search can only be an `error` event. The one
+that matters is cancellation, which by definition happens mid-search:
+
+```
+event: error
+data: {"error":"cancelled"}
+```
+
+This replaces the old `409 { "error": "cancelled" }` for this endpoint, and it
+may arrive *after* several `candidates` events have already been drawn. **A
+client must handle both shapes as the same condition** — the message string is
+identical precisely so it can. A stream that ends with an `error` never also
+sends `analysis`.
+
+**A running `analyze-game` is not affected.** The server arbitrates the one
+engine process, so an `analyze` issued during a sweep waits for the sweep's
+current position rather than cancelling the run — and a node the sweep has
+already reached is served from cache without waiting at all. Cancellation only
+ever happens between two `analyze` requests; clients do not need to serialise
+engine requests themselves.
 
 ### `POST /api/sessions/{id}/analyze-game` (SSE)
 
 Analyse the mainline from the start. `text/event-stream`. The `node` payload is a `PositionAnalysis` with an extra
 `node_id` — pairing it with the preceding `progress` event would break on a
 repeated position, and `fen` does not identify a node either.
+
+Unlike `/analyze`, a sweep does **not** emit per-depth `candidates` events. Forty
+positions narrating their searches is noise rather than progress, and the sweep
+already reports progress at the granularity that matters to it — one finished
+position at a time, which is what the move list annotates.
 
 Events are emitted **as each position finishes**: one `progress` and one `node`
 per position, then a single `done`. Positions the opening book accepts, and
@@ -290,6 +367,7 @@ to the user can be specific. The field is absent when `ok` is `true`.
 1. `GET /api/health`, `GET /api/languages`
 2. Paste a PGN → `POST /api/sessions`
 3. `POST /api/sessions/{id}/analyze-game` (SSE) to sweep the mainline, showing progress
-4. User moves a piece → `POST .../play` → `POST .../analyze`
+4. User moves a piece → `POST .../play` → `POST .../analyze` (SSE): draw each
+   `candidates` event as it lands, and wait for `analysis` before showing a verdict
 5. If the classification warrants it → `GET .../explain/{node_id}?lang=<selected>`
 6. Animate `counterfactual.pv` on the board

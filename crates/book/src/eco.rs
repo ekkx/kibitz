@@ -1,24 +1,36 @@
-//! Offline ECO opening names.
+//! Offline ECO opening lines.
 //!
 //! The five ECO volumes from `lichess-org/chess-openings` are embedded in the
-//! binary (see `data/README.md`) and replayed at first use into a position →
-//! opening map, so a position can be *named* without the network. This exists
-//! because the Lichess Opening Explorer has answered 401 to everyone since
-//! 2026-02-23 (lichess-org/lila#19610), which took opening names with it.
+//! binary (see `data/README.md`) and replayed at first use, so a position can be
+//! recognised without the network. This exists because the Lichess Opening
+//! Explorer has answered 401 to everyone since 2026-02-23
+//! (lichess-org/lila#19610), which took opening names with it.
 //!
-//! **Scope: names only.** A hit here says "this position has a name", which is a
-//! different question from "is this move still theory?". The latter needs the
-//! Explorer's game counts — how many masters actually played the move — which an
-//! ECO table does not carry. So nothing in this module ever produces
-//! [`kibitz_core::Classification::Book`]; that verdict stays with
-//! [`crate::BookVerdict::InBook`], and a name is display-only metadata.
+//! Two indexes come out of the same replay, and they answer different questions:
+//!
+//! - [`lookup`] — **what is this position called?** Keyed by the *terminal*
+//!   position of each vendored row, because that is the only position a row
+//!   actually names. Gappy by construction: a position in the middle of a named
+//!   line has no name of its own.
+//! - [`in_theory`] — **does this position occur in the table at all?** Keyed by
+//!   *every* position along every row. Continuous by construction, which is what
+//!   makes it usable as a book test; see [`crate::Book::judge`] for the rule
+//!   built on top of it and for why an ECO hit is a weaker claim than the
+//!   Explorer's game counts.
+//!
+//! **This module still hands out facts, not verdicts.** It says a position is
+//! named, or that it occurs in a vendored line. Turning either into
+//! [`crate::BookVerdict`] — and the guards that make that sound — is
+//! [`crate::Book`]'s job, because only the caller knows whether the Explorer,
+//! which is the authority, was reachable. There is a test below pinning that
+//! split down.
 //!
 //! The index key is the **EPD** (the FEN without the halfmove clock and fullmove
 //! number, exactly what [`kibitz_core::normalize_fen`] produces), so a position
 //! reached by a different move order resolves to the same opening.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry as MapEntry;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use kibitz_core::types::OpeningInfo;
@@ -74,26 +86,58 @@ impl Opening {
 /// measured cost).
 pub fn lookup(fen: &str) -> Option<Opening> {
     TABLE
+        .entries
         .get(kibitz_core::normalize_fen(fen).as_str())
         .map(|entry| entry.opening)
 }
 
-/// Number of distinct positions in the table. Equal to the number of vendored
-/// rows unless two of them name the same position; see the collision policy on
-/// `build`.
-pub fn position_count() -> usize {
-    TABLE.len()
+/// Whether this position occurs anywhere in the vendored lines — at the end of
+/// one, or partway along it.
+///
+/// This is the question [`lookup`] cannot answer. A row names only the position
+/// it ends on, so `lookup` reports `None` for every position inside a line: in
+/// `testdata/ruy_lopez_chigorin.pgn` plies 22 and 25 are named while 21, sitting
+/// between them, is not. Anything walking a game and asking "are we still in the
+/// book?" has to see a *continuous* answer, or theory appears to stop and restart
+/// every few moves. So this index holds every position each row passes through,
+/// the initial position included.
+///
+/// It is a much weaker statement than the Explorer's "N thousand games reached
+/// this position": the table carries no frequency at all, so a position occurs
+/// here if any one vendored line passes through it, however unusual. Callers are
+/// expected to guard it — see [`crate::Book::judge`].
+pub fn in_theory(fen: &str) -> bool {
+    TABLE
+        .theory
+        .contains(kibitz_core::normalize_fen(fen).as_str())
 }
 
-/// Built once, on first [`lookup`].
+/// Number of distinct *named* positions. Equal to the number of vendored rows
+/// unless two of them name the same position; see the collision policy on
+/// `build`.
+pub fn position_count() -> usize {
+    TABLE.entries.len()
+}
+
+/// Number of distinct positions reachable along the vendored lines, i.e. the
+/// size of the [`in_theory`] index.
+pub fn theory_position_count() -> usize {
+    TABLE.theory.len()
+}
+
+/// Built once, on first lookup.
 ///
 /// `LazyLock` rather than a build script or a generated table: replaying all
 /// 3,810 lines and hashing the results measures **4.7 ms in release** (80 ms in
 /// an unoptimised test build) on an M-series laptop — see the
 /// `building_the_table_is_cheap` test, which prints the number. That is far
 /// below the cost of maintaining generated code, it is paid once per process,
-/// and only by a process that actually names a position.
-static TABLE: LazyLock<HashMap<String, Entry>> = LazyLock::new(|| build().entries);
+/// and only by a process that actually consults the table.
+///
+/// Both indexes come from the one replay: walking a line already produces every
+/// position along it, so the [`in_theory`] set is a by-product of the work
+/// [`lookup`] needed anyway.
+static TABLE: LazyLock<Table> = LazyLock::new(build);
 
 /// The stored value. `plies` is the length of the ECO line that claimed this
 /// EPD; it is only used to resolve collisions at build time and is never
@@ -106,18 +150,22 @@ struct Entry {
 
 /// Result of parsing the volumes, with the diagnostics the tests assert on.
 ///
-/// Only `entries` is used at runtime; the rest is what keeps a data refresh
-/// honest, so it is dead code outside `cfg(test)` by design.
-#[cfg_attr(not(test), allow(dead_code))]
+/// `entries` and `theory` are used at runtime; the rest is what keeps a data
+/// refresh honest, so it is dead code outside `cfg(test)` by design.
 struct Table {
     entries: HashMap<String, Entry>,
+    /// Every position any row passes through — see [`in_theory`].
+    theory: HashSet<String>,
     /// Data rows read (header rows excluded).
+    #[cfg_attr(not(test), allow(dead_code))]
     rows: usize,
     /// Rows that could not be replayed, as `"file:line: eco name"`. A row that
     /// does not replay is skipped rather than fatal, but it means the vendored
     /// data is broken, so a test asserts this list is empty.
+    #[cfg_attr(not(test), allow(dead_code))]
     failed: Vec<String>,
     /// EPDs claimed by more than one row, as `(epd, kept, dropped)`.
+    #[cfg_attr(not(test), allow(dead_code))]
     collisions: Vec<(String, &'static str, &'static str)>,
 }
 
@@ -141,6 +189,11 @@ fn build() -> Table {
 /// exercise the collision policy on data that actually collides.
 fn build_from(volumes: &[(&'static str, &'static str)]) -> Table {
     let mut entries: HashMap<String, Entry> = HashMap::with_capacity(4096);
+    // The initial position is on every line, so it is seeded rather than
+    // discovered. It is deliberately absent from `entries` — no moves played is
+    // not a *named* opening — but it is unarguably in the book.
+    let mut theory: HashSet<String> = HashSet::with_capacity(16384);
+    theory.insert(epd_of(&Chess::default()));
     let mut rows = 0;
     let mut failed = Vec::new();
     let mut collisions = Vec::new();
@@ -160,10 +213,15 @@ fn build_from(volumes: &[(&'static str, &'static str)]) -> Table {
             };
             rows += 1;
 
-            let Some((epd, plies)) = replay(pgn) else {
+            let Some(line) = replay_line(pgn) else {
                 failed.push(format!("{file}:{}: {eco} {name}", index + 1));
                 continue;
             };
+            let plies = line.len() as u32;
+            // Every position the line passes through is theory; only the one it
+            // ends on gets a name.
+            let epd = line.last().expect("replay_line yields at least one").clone();
+            theory.extend(line);
             let entry = Entry {
                 opening: Opening { eco, name },
                 plies,
@@ -191,20 +249,24 @@ fn build_from(volumes: &[(&'static str, &'static str)]) -> Table {
 
     Table {
         entries,
+        theory,
         rows,
         failed,
         collisions,
     }
 }
 
-/// Replay a `pgn` column value and return `(EPD, plies)`.
+/// Replay a `pgn` column value into the EPD of every position it reaches, in
+/// order — one entry per ply, so the last is the position the line ends on and
+/// the length is the line's depth.
 ///
 /// `None` for a line that does not replay — an illegal or unparsable move, or no
-/// move at all. The starting position is deliberately not indexed: no moves
-/// played is not an opening.
-fn replay(pgn: &str) -> Option<(String, u32)> {
+/// move at all. The initial position is not among them: a zero-ply line is not
+/// an opening, and the root is seeded once by `build_from` instead of being
+/// repeated 3,810 times.
+fn replay_line(pgn: &str) -> Option<Vec<String>> {
     let mut pos = Chess::default();
-    let mut plies = 0;
+    let mut positions = Vec::new();
 
     for token in pgn.split_whitespace() {
         let token = strip_move_number(token);
@@ -215,10 +277,19 @@ fn replay(pgn: &str) -> Option<(String, u32)> {
         let mv = san.to_move(&pos).ok()?;
         // `to_move` already rejected anything illegal.
         pos.play_unchecked(mv);
-        plies += 1;
+        positions.push(epd_of(&pos));
     }
 
-    (plies > 0).then(|| (epd_of(&pos), plies))
+    (!positions.is_empty()).then_some(positions)
+}
+
+/// Where a `pgn` column value ends, as `(EPD, plies)`. Convenience over
+/// [`replay_line`] for callers that only care about the named position.
+#[cfg(test)]
+fn replay(pgn: &str) -> Option<(String, u32)> {
+    let line = replay_line(pgn)?;
+    let plies = line.len() as u32;
+    Some((line.into_iter().next_back()?, plies))
 }
 
 /// Drop a leading move number: `"1."` on its own, and the `"1.e4"` form some
@@ -311,6 +382,60 @@ mod tests {
         );
         // A bare king-and-pawn ending, likewise.
         assert_eq!(lookup("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1"), None);
+    }
+
+    #[test]
+    fn the_initial_position_is_theory_even_though_it_has_no_name() {
+        let start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+        assert_eq!(lookup(start), None, "no moves played, so nothing to name");
+        assert!(in_theory(start), "but every line passes through it");
+    }
+
+    /// The reason [`in_theory`] exists at all.
+    #[test]
+    fn in_theory_is_continuous_where_the_names_are_not() {
+        // The Chigorin main line. Every position along it is theory, but only
+        // some of them are the *end* of a vendored row, so `lookup` reports
+        // `None` for the rest — plies 21 and 23-24 among them.
+        let line = "1. e4 e5 2. Nf3 Nc6 3. Bb5 a6 4. Ba4 Nf6 5. O-O Be7 6. Re1 b5 \
+                    7. Bb3 d6 8. c3 O-O 9. h3 Na5 10. Bc2 c5 11. d4 Qc7";
+        let mut pos = Chess::default();
+        let mut named = 0;
+        for (ply, token) in line.split_whitespace().enumerate() {
+            let token = strip_move_number(token);
+            if token.is_empty() {
+                continue;
+            }
+            let mv = token.parse::<San>().unwrap().to_move(&pos).unwrap();
+            pos.play_unchecked(mv);
+            let epd = epd_of(&pos);
+            assert!(in_theory(&epd), "ply {ply} of the Chigorin left the index");
+            named += usize::from(lookup(&epd).is_some());
+        }
+        assert!(
+            named < 22,
+            "if every position along the line were named, `in_theory` would be redundant"
+        );
+    }
+
+    #[test]
+    fn a_position_no_line_passes_through_is_not_theory() {
+        // The same two positions the naming test uses: a late middlegame from
+        // the Opera Game, and a bare pawn ending.
+        assert!(!in_theory(
+            "1n1Rkb1r/p4ppp/4q3/4p1B1/4P3/8/PPP2PPP/2K5 b k - 1 17"
+        ));
+        assert!(!in_theory("4k3/8/8/8/8/8/4P3/4K3 w - - 0 1"));
+    }
+
+    #[test]
+    fn the_theory_index_is_bigger_than_the_name_index_and_still_small() {
+        // 3,810 named line ends; 7,855 positions along them, the initial position
+        // included. Roughly two positions per row rather than ten, because rows
+        // share their opening moves — which is why indexing whole lines costs
+        // almost nothing. Both numbers are canaries for a data refresh.
+        assert_eq!(position_count(), 3810);
+        assert_eq!(theory_position_count(), 7855);
     }
 
     #[test]
@@ -462,10 +587,17 @@ mod tests {
         );
     }
 
-    /// The constraint from the module docs, asserted rather than trusted: naming
-    /// a position must never leak into move classification. `Classification` is
-    /// not even reachable from this module — a future change that tries to make a
-    /// name imply `Book` has to defeat this test first.
+    /// The constraint from the module docs, asserted rather than trusted: this
+    /// module reports facts about the vendored table and never a verdict.
+    ///
+    /// The rule it enforces has narrowed. It used to mean "an ECO hit can never
+    /// make a move `Book`", full stop; since `Book::judge` gained the fallback,
+    /// [`in_theory`] *is* an input to that verdict. What stays true — and is what
+    /// this test now pins — is that the decision is not taken here. Only the
+    /// caller knows whether the Explorer, which outranks this table, was
+    /// reachable, and only the caller has the guards (continuity, the ply cap)
+    /// that make the weaker claim safe to act on. A future change that computes a
+    /// `BookVerdict` inside this module has to defeat this test first.
     #[test]
     fn the_eco_table_never_touches_classification() {
         let source = include_str!("eco.rs");
@@ -482,8 +614,9 @@ mod tests {
             .count();
         assert_eq!(
             uses, 0,
-            "eco.rs must not reference move classification: an ECO name says a \
-             position has a name, not that a move is still theory"
+            "eco.rs must not reference move classification: this module reports \
+             what the table contains, and `Book::judge` decides what that is \
+             worth"
         );
     }
 }

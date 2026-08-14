@@ -3,11 +3,55 @@ import type { Key } from 'chessground/types';
 import { analyze, createSession, getSession, play } from '../api/client.ts';
 import { runExclusive } from '../api/engineQueue.ts';
 import { ApiError } from '../api/transport.ts';
-import type { GameTree, Node, PositionAnalysis } from '../api/types.ts';
+import type { Candidate, GameTree, Node, PositionAnalysis } from '../api/types.ts';
 import { playMove as playLocally, type PromotionPiece } from '../chess/rules.ts';
 import { clearResumePoint, readResumePoint, writeResumePoint } from './resumeStorage.ts';
 
 export type AnalysisStatus = 'idle' | 'loading' | 'ready' | 'error';
+
+/**
+ * The shortest gap between two partial results reaching the screen.
+ *
+ * `/analyze` sends one event per completed depth, and the engine does not
+ * complete them at an even rate: measured over the 73 positions of the two test
+ * games at depth 12 / MultiPV 5, the depths from the streaming floor arrive at
+ * roughly 6, 9, 22, 47, 94, 163 and 289 ms. The first three land inside 22 ms of
+ * each other — three different pictures inside one and a half display frames,
+ * which is a flicker rather than progress — while the last few are 60 to 130 ms
+ * apart, which reads as the answer sharpening.
+ *
+ * And the pictures really are different. The board's arrows are clustered by win
+ * probability (`ui/arrows.ts`), so a small score change can reshuffle both the
+ * order and the stroke weights: the drawn top-3 changes on 60–92% of depth
+ * transitions, all the way to depth 12. Decomposed, that is mostly *which* moves
+ * are in the top three (29–62% of transitions) rather than their weights
+ * (5–16%), so damping the weight ramp would be treating the wrong thing — the
+ * ranks below the best move are genuinely unsettled at every depth, and no
+ * amount of smoothing makes them settle.
+ *
+ * What can be fixed is the cadence. A plain leading-edge throttle — draw the
+ * first partial immediately, then ignore any that arrives less than this long
+ * after the last one drawn — collapses the opening burst into one frame and
+ * leaves the well-spaced later updates alone. Measured effect at a 100 ms
+ * window: 7.0 partials drawn per search falls to 2.5, and visible changes to the
+ * arrows fall from 4.4 to 1.5, with **no cost to the time-to-first-arrow**,
+ * which is what the whole feature is for.
+ *
+ * There is deliberately no trailing timer to flush a partial the throttle held
+ * back. Nothing is lost by dropping one: the final `analysis` event is never
+ * throttled and always redraws, so the worst case is that the arrows sit at
+ * depth 10 for the last stretch instead of stepping through 11 — and a frame
+ * the eye never resolves is not worth a timer that can fire after the node has
+ * changed.
+ */
+const PARTIAL_MIN_INTERVAL_MS = 100;
+
+/** The engine's ranking mid-search, and the node it belongs to. */
+interface PartialAnalysis {
+  nodeId: number;
+  depth: number;
+  candidates: Candidate[];
+}
 
 export interface SessionState {
   status: 'empty' | 'opening' | 'ready';
@@ -56,8 +100,24 @@ export function useSession({ depth }: SessionInput): SessionState {
   const [analysisStatus, setAnalysisStatus] = useState<AnalysisStatus>('idle');
   const [analysisError, setAnalysisError] = useState<string | null>(null);
 
+  /**
+   * The ranking of the search that is running right now, if any.
+   *
+   * Deliberately **not** merged into `received`. `analyses` is the map of
+   * finished analyses: the move list annotates from it, the mistake navigation
+   * searches it, and the effect below treats a hit in it as "this node is done"
+   * and cancels the request. A partial in there would abort its own search a
+   * fifth of the way through and leave a depth-6 result on the tree forever.
+   *
+   * So it lives here, alone, and is overlaid onto the selected node's analysis
+   * only when there is no finished one — see `analysis` in the returned state.
+   */
+  const [partial, setPartial] = useState<PartialAnalysis | null>(null);
+
   /** The single-node analysis that is running or queued, and for which node. */
   const inFlight = useRef<{ nodeId: number; controller: AbortController } | null>(null);
+  /** When the last partial was allowed through, for `PARTIAL_MIN_INTERVAL_MS`. */
+  const lastPartialAt = useRef(0);
 
   const nodesById = useMemo(() => {
     const map = new Map<number, Node>();
@@ -117,6 +177,7 @@ export function useSession({ depth }: SessionInput): SessionState {
       setTree(response.tree);
       setHeaders(response.headers ?? {});
       setReceived(new Map());
+      setPartial(null);
       setCurrentId(response.tree.root);
       setStatus('ready');
       writeResumePoint({ sessionId: response.session_id, nodeId: response.tree.root });
@@ -177,6 +238,7 @@ export function useSession({ depth }: SessionInput): SessionState {
     setTree(null);
     setHeaders({});
     setReceived(new Map());
+    setPartial(null);
     setCurrentId(0);
     setAnalysisStatus('idle');
     setAnalysisError(null);
@@ -256,6 +318,12 @@ export function useSession({ depth }: SessionInput): SessionState {
    * for a running whole-game sweep instead of cancelling it (see
    * `api/engineQueue.ts`) — that is what lets the user click around the board
    * while the sweep runs.
+   *
+   * The response is a stream. Each `candidates` event updates the arrows, the
+   * candidate list and the eval bar; the classification, the accuracy and the
+   * counterfactual arrive only with the final result, because they are a
+   * judgement rather than a measurement and one that changes its mind on screen
+   * is worse than one that takes 300 ms (API.md, `POST .../analyze`).
    */
   const runAnalysis = useCallback(
     (nodeId: number, options: { force?: boolean } = {}) => {
@@ -265,23 +333,48 @@ export function useSession({ depth }: SessionInput): SessionState {
       inFlight.current = { nodeId, controller };
       setAnalysisStatus('loading');
       setAnalysisError(null);
+      // Whatever the previous search had drawn belonged to the previous search.
+      setPartial(null);
+      lastPartialAt.current = 0;
 
       runExclusive(async () => {
         // By the time the queue gets here the sweep may have covered this node,
         // or the user may have moved on. Either way, spend no engine time.
         if (controller.signal.aborted) return null;
         if (!options.force && analysesRef.current.has(nodeId)) return null;
-        return analyze(sessionId, { node_id: nodeId, depth }, controller.signal);
+        return analyze(
+          sessionId,
+          { node_id: nodeId, depth },
+          {
+            onCandidates: (event) => {
+              // The stream outlives the request only in the sense that events
+              // can still be in flight when the user moves on; a partial for a
+              // node nobody is looking at must not be drawn.
+              if (controller.signal.aborted) return;
+              const now = Date.now();
+              if (now - lastPartialAt.current < PARTIAL_MIN_INTERVAL_MS) return;
+              lastPartialAt.current = now;
+              setPartial({ nodeId, depth: event.depth, candidates: event.candidates });
+            },
+          },
+          controller.signal,
+        );
       }, controller.signal)
         .then((analysis) => {
           if (controller.signal.aborted) return;
           if (analysis) recordAnalysis(nodeId, analysis);
+          // The finished analysis supersedes the partial for this node, and the
+          // overlay below would hide it if the partial stayed.
+          setPartial((current) => (current?.nodeId === nodeId ? null : current));
           setAnalysisStatus('ready');
         })
         .catch((error: unknown) => {
           if (controller.signal.aborted) return;
-          // A 409 "cancelled" means a newer analyze superseded this one; the
-          // newer request owns the UI state, so stay quiet.
+          setPartial((current) => (current?.nodeId === nodeId ? null : current));
+          // "cancelled" means a newer analyze superseded this one; the newer
+          // request owns the UI state, so stay quiet. It reaches us as a 409
+          // whether the server refused before the stream opened or stopped
+          // midway through it — `client.ts` normalises the two shapes.
           if (error instanceof ApiError && error.isCancelled) return;
           if (error instanceof DOMException && error.name === 'AbortError') return;
           setAnalysisError(error instanceof Error ? error.message : String(error));
@@ -316,6 +409,36 @@ export function useSession({ depth }: SessionInput): SessionState {
     if (currentNode) runAnalysis(currentNode.id, { force: true });
   }, [currentNode, runAnalysis]);
 
+  /**
+   * What the panel and the board describe: the finished analysis for the
+   * selected node, or — while its search is still running — the ranking so far,
+   * dressed as a `PositionAnalysis` with **no context**.
+   *
+   * `context: null` is the whole of the design rule, expressed in one field. It
+   * is the shape the server already sends for the root node, so every consumer
+   * handles it: the classification badge, the accuracy figure, the delta, the
+   * rank line, the counterfactual block and the "explain this move" button are
+   * all gated on `context.played` and simply do not render. What does render is
+   * everything a ranking can honestly support — the candidate list, the ranked
+   * arrows and the eval bar — plus the depth in the panel header, which is read
+   * off this object and so is always the depth of the numbers beside it.
+   *
+   * Keying on `nodeId` is what stops a stale verdict, or a stale ranking, from
+   * appearing under a node it does not belong to: a partial for another node is
+   * not shown at all, and the selected node falls back to `null` until its own
+   * first partial lands.
+   */
+  const partialAnalysis = useMemo<PositionAnalysis | null>(() => {
+    if (!partial || partial.nodeId !== currentId || !currentNode) return null;
+    return {
+      fen: currentNode.fen,
+      depth: partial.depth,
+      candidates: partial.candidates,
+      context: null,
+      explanations: {},
+    };
+  }, [partial, currentId, currentNode]);
+
   return {
     status,
     openError,
@@ -325,7 +448,7 @@ export function useSession({ depth }: SessionInput): SessionState {
     currentId,
     currentNode,
     analyses,
-    analysis: analyses.get(currentId) ?? null,
+    analysis: analyses.get(currentId) ?? partialAnalysis,
     analysisStatus,
     analysisError,
     open,

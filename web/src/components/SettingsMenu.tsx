@@ -1,5 +1,4 @@
 import { Settings2 } from 'lucide-react';
-import type { LanguageOption } from '../api/types.ts';
 import { Button } from './ui/button.tsx';
 import { Label } from './ui/label.tsx';
 import { Popover, PopoverContent, PopoverTrigger } from './ui/popover.tsx';
@@ -16,10 +15,6 @@ import { t } from '../i18n/index.ts';
 
 export interface SettingsMenuProps {
   settings: SettingsState;
-  /** The language picker — interface and explanations both — folded in here. */
-  languages: LanguageOption[];
-  language: string;
-  onLanguageChange: (code: string) => void;
 }
 
 /**
@@ -27,8 +22,14 @@ export interface SettingsMenuProps {
  *
  * Everything in it is a single control with an immediate effect, so there is no
  * Save and no Cancel — the arrow count redraws the board as it changes, the
- * language switches the interface under the cursor, and the depth is simply the
- * number the next request carries.
+ * sound is on or off from the next move, and the depth is simply the number the
+ * next request carries.
+ *
+ * Three controls, and it stays a popover rather than shrinking to a menu: what
+ * is left is two segmented controls and a select, which is a panel of *widgets*
+ * and not a list of choices. Language used to be the fourth and now sits in the
+ * topbar (`LanguageMenu`), where its current value is readable without opening
+ * anything — a thing worth knowing at a glance does not belong behind a gear.
  *
  * Open/closed state, Escape, click-outside, focus return and the trigger's
  * `aria-expanded` are all Base UI's now. The component used to own about thirty
@@ -37,12 +38,7 @@ export interface SettingsMenuProps {
  * right by construction — the listeners were, for instance, `mousedown` only,
  * so a touch outside never dismissed it.
  */
-export function SettingsMenu({
-  settings,
-  languages,
-  language,
-  onLanguageChange,
-}: SettingsMenuProps): React.JSX.Element {
+export function SettingsMenu({ settings }: SettingsMenuProps): React.JSX.Element {
   return (
     <Popover>
       <PopoverTrigger
@@ -54,7 +50,7 @@ export function SettingsMenu({
       />
 
       <PopoverContent align="end" sideOffset={8} className="w-80 gap-5" aria-label={t('settings.title')}>
-        <Group label={t('settings.arrows.label')} hint={t('settings.arrows.hint')}>
+        <Group label={t('settings.arrows.label')}>
           <ToggleGroup
             {...SEGMENTED}
             aria-label={t('settings.arrows.label')}
@@ -78,7 +74,7 @@ export function SettingsMenu({
         {/* Next to the arrows rather than next to the depth: both of these are
             about what the board does while you look at it, whereas depth is
             about what the server is asked for. */}
-        <Group label={t('settings.sound.label')} hint={t('settings.sound.hint')}>
+        <Group label={t('settings.sound.label')}>
           <ToggleGroup
             {...SEGMENTED}
             aria-label={t('settings.sound.label')}
@@ -127,32 +123,6 @@ export function SettingsMenu({
           </Select>
         </Group>
 
-        {languages.length > 0 && (
-          <Group label={t('lang.label')} hint={t('lang.hint')}>
-            <Select
-              value={language}
-              onValueChange={(value) => {
-                if (typeof value === 'string') onLanguageChange(value);
-              }}
-            >
-              <SelectTrigger className="w-full" aria-label={t('lang.label')}>
-                <SelectValue>
-                  {(code: string) =>
-                    languages.find((option) => option.code === code)?.name ?? code
-                  }
-                </SelectValue>
-              </SelectTrigger>
-              <SelectContent>
-                {/* Endonyms from the server: never translated, never localised. */}
-                {languages.map((option) => (
-                  <SelectItem key={option.code} value={option.code}>
-                    {option.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </Group>
-        )}
       </PopoverContent>
     </Popover>
   );
@@ -181,21 +151,29 @@ const SEGMENTED = {
 const SEGMENT =
   'flex-1 rounded-full font-mono hover:bg-background/60 aria-pressed:bg-background aria-pressed:text-foreground aria-pressed:shadow-sm';
 
-/** Label, control, hint — the same three rows for every setting in the panel. */
+/**
+ * Label, control, and a hint only where there is something to say.
+ *
+ * The hint used to be mandatory, and a mandatory hint is a slot that gets
+ * filled: two of the four settings ended up with a sentence restating their own
+ * label, which is text the user has to read past every time they open this
+ * panel to change something else. A setting whose consequence is visible the
+ * moment it is changed explains itself better than any sentence here can.
+ */
 function Group({
   label,
   hint,
   children,
 }: {
   label: string;
-  hint: string;
+  hint?: string;
   children: React.ReactNode;
 }): React.JSX.Element {
   return (
     <div className="flex flex-col gap-2">
       <Label>{label}</Label>
       {children}
-      <p className="text-xs leading-relaxed text-muted-foreground">{hint}</p>
+      {hint && <p className="text-xs leading-relaxed text-muted-foreground">{hint}</p>}
     </div>
   );
 }

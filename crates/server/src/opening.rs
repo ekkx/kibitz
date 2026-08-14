@@ -4,10 +4,26 @@
 //! `kibitz-book`, which depends on core, not the other way round. So every place
 //! that creates a node goes through here.
 //!
-//! **Names only.** A hit gives the position a name for the UI; it says nothing
-//! about whether the move that reached it is still theory, and never turns into
-//! `Classification::Book`. That verdict comes from the Opening Explorer's game
-//! counts (`kibitz_book::Book`), which an ECO table does not carry.
+//! **This is the display path, and it is not the book verdict.** A hit here
+//! gives the position a name for the UI. Whether the *move* was still theory is
+//! decided elsewhere, by `kibitz_book::Book::judge`, and reaches a move as
+//! `Classification::Book` only through `pipeline::book_context`.
+//!
+//! The two used to be strictly separate: names came from the ECO table, verdicts
+//! only from the Opening Explorer's game counts. They now share a source —
+//! `Book::judge` falls back to the same embedded table when the Explorer is
+//! unreachable, which since 2026-02-23 is always — but they still ask different
+//! questions of it, and the answers do not line up move for move:
+//!
+//! - `lookup` here indexes only the position each ECO row *ends* on, so it is
+//!   gappy: an unnamed position between two named ones is normal.
+//! - The verdict uses `eco::in_theory`, which indexes every position a row passes
+//!   through, and guards it with continuity and a ply cap.
+//!
+//! So a node can carry a name without its move being `Book` (the game had already
+//! left theory and transposed back), and far more often it is `Book` with no name
+//! of its own. Neither is a bug; a name is not a verdict, and this module still
+//! never produces one.
 //!
 //! A lookup is one hash probe, so nodes are annotated as they are born and
 //! nothing is cached.
@@ -154,9 +170,11 @@ mod tests {
 
     #[test]
     fn a_move_out_of_theory_is_simply_unnamed() {
-        // Nothing inherits: a position the table does not know reports `None`
-        // rather than the last name seen. The Opera Game leaves theory at
-        // 3... Bg4 and never comes back.
+        // Nothing inherits: a position no ECO row *ends* on reports `None`
+        // rather than the last name seen. The Opera Game's last named position
+        // is 3. d4 and no later one is named again. (The book verdict runs two
+        // plies further — `eco::in_theory` knows 3... Bg4 and 4. dxe5 from
+        // inside a line. Different index, different question.)
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/opera_game.pgn");
         let tree = imported(&std::fs::read_to_string(path).expect("testdata"));
@@ -171,9 +189,11 @@ mod tests {
     /// The constraint that matters most: a name is not a verdict.
     ///
     /// `Classification::Book` is produced in exactly one place —
-    /// `pipeline::book_context`, reached only from `BookVerdict::InBook`, which
-    /// needs the Opening Explorer's game counts. Feeding a name from the ECO
-    /// table into the ordinary engine path must leave the classification alone.
+    /// `pipeline::book_context`, reached only from `BookVerdict::InBook`.
+    /// `Book::judge` may now reach that verdict from the ECO table rather than
+    /// from the Explorer, but only under its own rules; the display name this
+    /// module attaches is not one of them. Feeding a name into the ordinary
+    /// engine path must still leave the classification alone.
     #[test]
     fn a_named_position_never_classifies_a_move_as_book() {
         use kibitz_core::eval::Score;

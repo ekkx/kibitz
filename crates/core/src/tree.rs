@@ -32,7 +32,12 @@ pub struct Node {
     /// Lazily computed.
     pub analysis: Option<PositionAnalysis>,
     /// The named opening this position belongs to, from the embedded ECO table.
-    /// Display only — this never makes a move `Classification::Book`.
+    ///
+    /// Display only. A name is not a verdict: `Classification::Book` is decided
+    /// separately by `kibitz_book::Book::judge`, which asks the same table a
+    /// different question (every position a line passes through, not just the
+    /// one it is named after) and guards the answer. The two do not line up move
+    /// for move — a book move usually has no name of its own.
     ///
     /// Filled in by whoever creates the node (`kibitz-server`): the ECO table
     /// lives in `kibitz-book`, which depends on this crate, so the tree only

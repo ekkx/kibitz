@@ -6,7 +6,6 @@ import {
   ChevronLast,
   ChevronLeft,
   ChevronRight,
-  FlipVertical2,
   Moon,
   Sun,
 } from 'lucide-react';
@@ -22,6 +21,9 @@ import { PromotionPicker } from './components/PromotionPicker.tsx';
 import { AnalysisPanel } from './components/AnalysisPanel.tsx';
 import { ImportScreen } from './components/ImportScreen.tsx';
 import { MoveBadge } from './components/MoveBadge.tsx';
+import { LanguageMenu } from './components/LanguageMenu.tsx';
+import { PlayerStrip } from './components/PlayerStrip.tsx';
+import { FlipBoardIcon } from './components/FlipIcon.tsx';
 import { SettingsMenu } from './components/SettingsMenu.tsx';
 import { GameSweepButton, SweepSummary } from './components/GameSweep.tsx';
 import { OpeningCaption } from './components/OpeningCaption.tsx';
@@ -36,6 +38,7 @@ import { useTheme, usePersistent } from './state/usePersistent.ts';
 import { REPLAY_MOVE_MS, useReplay } from './hooks/useReplay.ts';
 import { useBoardTransition } from './hooks/useBoardTransition.ts';
 import {
+  material,
   needsPromotion,
   terminalScore,
   turnColor,
@@ -43,8 +46,9 @@ import {
   type Color,
   type PromotionPiece,
 } from './chess/rules.ts';
-import { formatSanLine, isNotable } from './ui/format.ts';
-import { positionShapes, previewShapes } from './ui/arrows.ts';
+import { formatSanLine } from './ui/format.ts';
+import { BRUSH, positionShapes, previewShapes } from './ui/arrows.ts';
+import { explanationFens, sanFrames, type SanMention } from './ui/sanMentions.ts';
 import { findMistake, type MistakeDirection } from './ui/mistakes.ts';
 import { playSound, soundForSan } from './ui/sounds.ts';
 import { stepSound } from './ui/stepSound.ts';
@@ -75,7 +79,6 @@ export function App(): React.JSX.Element {
   const analysis = session.analysis;
   const played = analysis?.context?.played ?? null;
   const counterfactual = analysis?.context?.counterfactual ?? null;
-  const notable = played ? isNotable(played.classification) : false;
 
   // The opening the *selected* position belongs to, which is the deepest named
   // node on its path — a position past the end of a named line keeps the name.
@@ -89,18 +92,22 @@ export function App(): React.JSX.Element {
     sessionId: session.sessionId,
     nodeId: session.currentNode?.id ?? null,
     lang: language,
-    auto: notable,
     preloaded: analysis?.explanations?.[language],
   });
 
   /**
-   * The counterfactual replay is started by hand, from **Replay line** in the
-   * panel, and never by selecting a move. Taking the board away from the user
-   * the instant they click a blunder — for two seconds of animation they did
-   * not ask for, hiding the arrows that answer the question they clicked to ask
-   * — is a worse trade than one button press. The explanation still arrives on
-   * its own (`auto: notable` above): it streams into the panel and leaves the
-   * board alone.
+   * Nothing on this screen starts by itself. The counterfactual replay is
+   * started from **Replay line** in the panel and the explanation from
+   * **Explain this move**, and selecting a move triggers neither.
+   *
+   * Both were once automatic on a blunder, and both were wrong for the same
+   * reason: they are expensive answers to a question the user has not asked
+   * yet. The replay takes the board away for two seconds of animation, hiding
+   * the arrows that answer the question they clicked to ask; the explanation
+   * spends a model call per position crossed, which an arrow key held down
+   * turns into a dozen. One button press each is the cheaper trade, and a
+   * cached explanation still appears the instant it is selected — that costs
+   * nothing and was never the part anyone objected to.
    */
 
   /**
@@ -272,26 +279,81 @@ export function App(): React.JSX.Element {
    * position, so selecting another node drops it.
    */
   const [preview, setPreview] = useState<Candidate | null>(null);
-  useEffect(() => setPreview(null), [session.currentId]);
 
   /**
-   * The board's two hovers, kept apart.
+   * A move or a square named in the written explanation that the pointer is
+   * currently over.
+   *
+   * The text quotes moves from several positions — the one before the played
+   * move, the one on the board, and a ply at a time down whatever line it is
+   * walking — so a mention carries the squares it resolved to rather than a SAN
+   * for this component to re-interpret. `ui/sanMentions.ts` does the resolving,
+   * and refuses to hand back a move that is not legal in a position it can
+   * name; a bare coordinate that is no move at all comes back as the square it
+   * names instead.
+   */
+  const [sanHover, setSanHover] = useState<SanMention | null>(null);
+
+  // Both belong to the position that was selected, so selecting another drops
+  // them — including the case where the pointer never moved and so never left.
+  useEffect(() => {
+    setPreview(null);
+    setSanHover(null);
+  }, [session.currentId]);
+
+  /**
+   * The positions the explanation's moves are read against, rebuilt when the
+   * analysis changes and not once per streamed token — generating legal moves
+   * is the expensive half, and the text arrives in a few hundred pieces.
+   */
+  const beforeFen = useMemo(() => {
+    const parent = session.currentNode?.parent;
+    if (parent === null || parent === undefined) return null;
+    return session.tree?.nodes.find((node) => node.id === parent)?.fen ?? null;
+  }, [session.currentNode, session.tree]);
+
+  const frames = useMemo(
+    () => sanFrames(explanationFens(analysis, beforeFen)),
+    [analysis, beforeFen],
+  );
+
+  /**
+   * The board's three hovers, kept apart.
    *
    * Pointing at a *candidate* draws a line on the position that is on the
-   * board; pointing at a *move* puts a different position on the board. They
-   * are answers in different frames, and a board doing both at once would be
-   * drawing one position's engine line over another position's pieces. So each
-   * hover cancels the other on the way in: whichever the pointer is in now is
-   * the only one live.
+   * board; pointing at a *move in the list* puts a different position on the
+   * board; pointing at a *move named in the explanation* draws it in whichever
+   * frame it belongs to. They are answers in different frames, and a board
+   * doing two of them at once would be drawing one position's line over
+   * another position's pieces. So each hover cancels the others on the way in:
+   * whichever the pointer is in now is the only one live.
+   *
+   * A pointer can only be in one place, so this is mostly belt and braces — but
+   * a hover can end without a `mouseleave` when the thing being hovered stops
+   * existing under a stationary cursor, which streaming text does constantly.
    */
   const previewCandidate = useCallback((candidate: Candidate | null) => {
-    if (candidate) setHoverId(null);
+    if (candidate) {
+      setHoverId(null);
+      setSanHover(null);
+    }
     setPreview(candidate);
   }, []);
 
   const hoverMove = useCallback((nodeId: number | null) => {
-    if (nodeId !== null) setPreview(null);
+    if (nodeId !== null) {
+      setPreview(null);
+      setSanHover(null);
+    }
     setHoverId(nodeId);
+  }, []);
+
+  const hoverSan = useCallback((mention: SanMention | null) => {
+    if (mention) {
+      setPreview(null);
+      setHoverId(null);
+    }
+    setSanHover(mention);
   }, []);
 
   /**
@@ -307,8 +369,23 @@ export function App(): React.JSX.Element {
    *      be a claim about the wrong board, and the one that reads worst is the
    *      red mistake arrow, which would appear to accuse a move three plies
    *      away. A preview changes the position and says nothing else;
-   *   3. otherwise a previewed candidate, because the user is asking for it;
-   *   4. otherwise the engine's ranked arrows for the position on the board.
+   *   3. otherwise the notation the user is pointing at *in the written
+   *      explanation*, which is a question — "where is Qxg3?", or of a bare
+   *      coordinate that is no move here, "which one is e8?" — that only a mark
+   *      on the board answers, and which must not be answered alongside
+   *      anything else, because the whole of the answer is "that one, there".
+   *      A move is drawn in the frame it belongs to rather than the board's,
+   *      which is a stretch this app already makes for the mistake pair
+   *      (`ui/arrows.ts`) and for the same reason: the move being talked about
+   *      is the subject, and a move only exists in the position it is played
+   *      from. A square needs no frame — see `ui/sanMentions.ts` on why the two
+   *      are told apart by legality;
+   *   4. otherwise a previewed candidate, because the user is asking for it;
+   *   5. otherwise the engine's ranked arrows for the position on the board.
+   *
+   * 3 and 4 are mutually exclusive by construction (see the hover callbacks
+   * above), so their order here is a statement of intent rather than a tie-break
+   * that ever fires.
    *
    * Only the last is governed by the arrow-count setting: the others are
    * answers to something the user did, not board density chosen in advance.
@@ -316,6 +393,13 @@ export function App(): React.JSX.Element {
   const shapes = useMemo<DrawShape[]>(() => {
     if (replay.active) return replay.finished ? motifShapes(counterfactual?.motifs ?? []) : [];
     if (hoverNode) return [];
+    // One brush for both: an arrow to a move, a circle on a square. Same
+    // feature, same colour, so the two read as one thing the text can do.
+    if (sanHover) {
+      return sanHover.kind === 'move'
+        ? [{ orig: sanHover.from, dest: sanHover.to, brush: BRUSH.preview }]
+        : [{ orig: sanHover.square, brush: BRUSH.preview }];
+    }
     if (preview && analysis) return previewShapes(analysis.fen, preview);
     return positionShapes(analysis, settings.arrowCount);
   }, [
@@ -323,6 +407,7 @@ export function App(): React.JSX.Element {
     replay.finished,
     counterfactual,
     hoverNode,
+    sanHover,
     preview,
     analysis,
     settings.arrowCount,
@@ -399,6 +484,68 @@ export function App(): React.JSX.Element {
     return () => window.removeEventListener('keydown', onKey);
   }, [step, orientation, setOrientation, jumpToMistake, promotion]);
 
+  /**
+   * The two player strips, above and below the board.
+   *
+   * `nearColor` is simply the orientation: the side you are looking from is the
+   * side at the bottom of the picture, which is what "flip the board" means.
+   *
+   * The material is read from `boardFen` rather than from the selected node,
+   * and that is the whole of what makes it honest. `boardFen` is whatever is
+   * actually drawn — the selected position, a move being previewed in the list,
+   * or a counterfactual line mid-replay — and a captured-piece row is a claim
+   * about the pieces on screen. During a replay especially: those moves were
+   * never played, there is no history to count, and the only truthful source is
+   * the position itself (`material`, in `chess/rules.ts`).
+   */
+  const nearColor: Color = orientation;
+  const farColor: Color = orientation === 'white' ? 'black' : 'white';
+  const balance = useMemo(() => material(boardFen), [boardFen]);
+  const playerName = (color: Color): string =>
+    color === 'white'
+      ? (session.headers.White ?? t('session.white'))
+      : (session.headers.Black ?? t('session.black'));
+
+  /**
+   * How wide the board actually came out, so the strips can be exactly that
+   * wide and no wider.
+   *
+   * This is measured rather than expressed in CSS because the board's width is
+   * *derived*: it is `aspect-square` on a height that comes from the window, or
+   * from `max-w-full` when the column is the narrower constraint, and there is
+   * no way for a sibling to name the result. A full-column strip is visibly
+   * wrong — the column is far wider than the board whenever the board is
+   * height-bound, so the name floats off to the left and the material score
+   * ends up level with the analysis panel instead of with the h-file.
+   *
+   * The strips are also nudged right by the eval bar's share of the row, so
+   * that "centred in the column" becomes "centred on the board": the row
+   * centres the eval bar and the board together, which puts the board's centre
+   * half a bar and half a gap to the right of the column's.
+   */
+  const boardBox = useRef<HTMLDivElement>(null);
+  const boardColumn = useRef<HTMLDivElement>(null);
+  const [stripBox, setStripBox] = useState<{ width: number; left: number } | null>(null);
+  useEffect(() => {
+    const board = boardBox.current;
+    const column = boardColumn.current;
+    if (!board || !column || typeof ResizeObserver === 'undefined') return;
+    const measure = (): void => {
+      const inner = board.getBoundingClientRect();
+      const outer = column.getBoundingClientRect();
+      setStripBox({ width: inner.width, left: inner.left - outer.left });
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(board);
+    observer.observe(column);
+    return () => observer.disconnect();
+  }, [session.status]);
+
+  /** Until the first measurement lands, a plain full-width row. */
+  const stripStyle: React.CSSProperties = stripBox
+    ? { width: stripBox.width, marginLeft: stripBox.left, alignSelf: 'flex-start' }
+    : {};
+
   const best = analysis?.candidates[0] ?? null;
   const sideToMove: Color = session.currentNode ? turnColor(session.currentNode.fen) : 'white';
   // A mated position has no candidates; the bar still has something to say.
@@ -409,30 +556,30 @@ export function App(): React.JSX.Element {
   return (
     <div className="flex h-full flex-col">
       <header className="flex min-h-14 flex-none flex-wrap items-center gap-x-3 gap-y-2 border-b px-4 py-2">
-        <div className="flex items-baseline gap-2.5">
-          <span className="text-[0.9375rem] font-semibold tracking-tight">{t('app.name')}</span>
-          {/* First thing to go when the bar gets tight: it is the only text up
-              here that nobody needs twice. */}
-          <span className="hidden text-xs text-muted-foreground xl:inline">
-            {t('app.tagline')}
-          </span>
-        </div>
+        {/* The name, and nothing beside it. There was a tagline here —
+            "interactive chess analysis that explains why" — which is a true
+            sentence to put on a landing page and a redundant one to put above
+            a board that is already doing it. */}
+        <span className="text-[0.9375rem] font-semibold tracking-tight">{t('app.name')}</span>
 
-        {session.status === 'ready' && (
-          <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
-            <span className="truncate font-medium text-foreground">
-              {session.headers.White ?? t('session.white')}
-            </span>
-            <span aria-hidden="true">·</span>
-            <span className="truncate font-medium text-foreground">
-              {session.headers.Black ?? t('session.black')}
-            </span>
-            {session.headers.Result && (
-              <Badge variant="outline" className="font-mono">
-                {session.headers.Result}
-              </Badge>
-            )}
-          </div>
+        {/*
+          The result, and not the two names beside it any more.
+
+          The names were here because there was nowhere else to put them, and a
+          topbar is the wrong place: "White · Black" is a row, a row has no top
+          and no bottom, and the question in front of a board is which of the two
+          you are looking at from below. `PlayerStrip` answers that by being in
+          the place it is talking about, so the names live there now and this
+          would only be a second, weaker copy of them.
+
+          The result stays, because nothing else on the screen says it: it is a
+          fact about the game as a whole rather than about either player, which
+          is exactly what this bar is for.
+        */}
+        {session.status === 'ready' && session.headers.Result && (
+          <Badge variant="outline" className="font-mono text-muted-foreground">
+            {session.headers.Result}
+          </Badge>
         )}
 
         {/*
@@ -447,12 +594,8 @@ export function App(): React.JSX.Element {
           {IS_MOCK && <Badge variant="secondary">{t('health.mockBadge')}</Badge>}
           <HealthChip health={health} />
           {session.status === 'ready' && <GameSweepButton sweep={sweep} />}
-          <SettingsMenu
-            settings={settings}
-            languages={languages}
-            language={language}
-            onLanguageChange={setLanguage}
-          />
+          <LanguageMenu options={languages} language={language} onChange={setLanguage} />
+          <SettingsMenu settings={settings} />
           {/*
             Two icons, one shown at a time, decided in CSS rather than in React.
             `useTheme` still carries the legacy `'system'` choice, so the
@@ -508,12 +651,40 @@ export function App(): React.JSX.Element {
           {/*
             The board sizes itself from the available *height* — the square is
             derived from it via `aspect-square`, and `max-w-full` pulls it back
-            in when the column is narrower than it is tall. Stacked there is no
-            column height to derive from, so one is named, and the column is
-            fixed at it rather than being allowed to shrink.
+            in when the column is narrower than it is tall.
+
+            Which row that height is named on is the whole of how the player
+            strips are paid for. Stacked, there is no window height to share, so
+            the height belongs to the *board row* and the column is whatever its
+            contents come to: the strips add their own lines and the board keeps
+            every pixel it had. Wide, the column is `h-full` — the window,
+            once — and the board row takes what the strips and the toolbar leave,
+            because there is nowhere else for that space to come from. That is
+            what makes every pixel in `PlayerStrip` a pixel off the board, and
+            why it is set as tight as it is.
+
+            The gap is `gap-1` and not the `gap-2` the rest of the page uses, for
+            the same reason. Each strip grew from one line to two — a name over
+            its own tally, rather than the two fighting for one row — which is
+            seven pixels each, and halving the three gaps in this column gives
+            most of it straight back. The strips are also *supposed* to sit close
+            to the board: they are its caption, and a caption a comfortable
+            distance away from the thing it captions is a separate panel. The
+            toolbar keeps the old distance with an `mt-1` of its own, because it
+            is a separate instrument rather than part of the board.
           */}
-          <div className="flex h-[min(78vw,70vh)] min-h-0 shrink-0 flex-col items-center gap-3 lg:h-full">
-            <div className="flex min-h-0 w-full flex-1 items-stretch justify-center gap-3">
+          <div
+            ref={boardColumn}
+            className="flex min-h-0 shrink-0 flex-col items-center gap-1 lg:h-full"
+          >
+            <PlayerStrip
+              color={farColor}
+              name={playerName(farColor)}
+              captured={farColor === 'white' ? balance.whiteCaptured : balance.blackCaptured}
+              lead={farColor === 'white' ? balance.advantage : -balance.advantage}
+              style={stripStyle}
+            />
+            <div className="flex h-[min(78vw,70vh)] min-h-0 w-full items-stretch justify-center gap-3 lg:h-auto lg:flex-1">
               <EvalBar
                 score={barScore}
                 winProb={barWinProb}
@@ -529,9 +700,23 @@ export function App(): React.JSX.Element {
                 containment is safe here, because the width comes from the
                 aspect ratio and the row's height, never from the contents.
               */}
+              {/*
+                Square corners, deliberately. There is no border here and never
+                was — what read as a frame was `rounded-2xl` biting 13px off each
+                corner square against `overflow-hidden`, so a1 and h8 were drawn
+                as something other than squares. A chessboard's outline is the
+                grid's own outline; anything that shortens it is a picture frame
+                around the position.
+
+                `overflow-hidden` stays, and is load-bearing rather than left
+                over: `MoveBadge` hangs half a disc off the corner of the square
+                it marks and clamps against exactly this box, and the replay's
+                caption is laid out to the box's bottom edge.
+              */}
               <div
+                ref={boardBox}
                 className={cn(
-                  'relative aspect-square h-full max-w-full overflow-hidden rounded-2xl shadow-md @container',
+                  'relative aspect-square h-full max-w-full overflow-hidden shadow-md @container',
                   replay.active && 'ring-2 ring-primary',
                 )}
               >
@@ -592,12 +777,15 @@ export function App(): React.JSX.Element {
                   `z-[3]` clears chessground's pieces and its highlight layers
                   and stays under the badge at 10 — though the badge is hidden
                   while a replay runs, so the two never actually meet.
+
+                  It says what the line *is*; it used to also say "replaying on
+                  the board", to a reader watching pieces move on a board ringed
+                  in the accent colour.
                 */}
                 {replay.active && counterfactual && (
                   <div className="absolute inset-x-0 bottom-0 z-[3] flex items-center justify-between gap-2.5 bg-primary px-3 py-1.5 text-xs text-primary-foreground">
                     <span className="shrink-0">
-                      {t(`counterfactual.${counterfactual.kind}` as const)} ·{' '}
-                      {t('counterfactual.playing')}
+                      {t(`counterfactual.${counterfactual.kind}` as const)}
                     </span>
                     <span className="truncate font-mono opacity-90">
                       {formatSanLine(counterfactual.start_fen, counterfactual.pv)}
@@ -607,6 +795,14 @@ export function App(): React.JSX.Element {
               </div>
             </div>
 
+            <PlayerStrip
+              color={nearColor}
+              name={playerName(nearColor)}
+              captured={nearColor === 'white' ? balance.whiteCaptured : balance.blackCaptured}
+              lead={nearColor === 'white' ? balance.advantage : -balance.advantage}
+              style={stripStyle}
+            />
+
             {/*
               One bordered toolbar rather than five loose buttons: these are a
               single instrument — the transport for the game — and grouping
@@ -614,7 +810,7 @@ export function App(): React.JSX.Element {
               the page is grouped. The separator marks the one that is not
               navigation: flipping the board changes the view, not the position.
             */}
-            <div className="flex flex-none items-center gap-0.5 rounded-4xl border bg-card p-1 shadow-sm">
+            <div className="mt-1 flex flex-none items-center gap-0.5 rounded-4xl border bg-card p-1 shadow-sm">
               <Button
                 variant="ghost"
                 size="icon-sm"
@@ -651,7 +847,12 @@ export function App(): React.JSX.Element {
               >
                 <ChevronLast />
               </Button>
-              <Separator orientation="vertical" className="mx-1 h-4" />
+              {/* No height of its own: `Separator` is `self-stretch` when it is
+                  vertical, so it takes the flex line's cross size — which is
+                  the buttons. It carried `h-4` before, half the height of
+                  everything beside it, which read as a rendering fault rather
+                  than as a rule. */}
+              <Separator orientation="vertical" className="mx-1" />
               <Button
                 variant="ghost"
                 size="icon-sm"
@@ -659,7 +860,7 @@ export function App(): React.JSX.Element {
                 title={t('board.flip')}
                 aria-label={t('board.flip')}
               >
-                <FlipVertical2 />
+                <FlipBoardIcon />
               </Button>
             </div>
           </div>
@@ -706,8 +907,10 @@ export function App(): React.JSX.Element {
               sessionId={session.sessionId}
               nodeId={session.currentNode.id}
               lang={language}
+              frames={frames}
               onPlaySan={onPlaySan}
               onPreview={previewCandidate}
+              onHoverSan={hoverSan}
               onAnalyze={session.analyzeCurrent}
             />
           </aside>

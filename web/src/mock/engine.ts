@@ -18,7 +18,13 @@ import type {
   PositionAnalysis,
   Score,
 } from '../api/types.ts';
-import { SCRIPTED_MATES, SCRIPTED_MOVES, openingForPath, type ScriptedMove } from './fixtures.ts';
+import {
+  SCRIPTED_MATES,
+  SCRIPTED_MOVES,
+  isBookPath,
+  openingForPath,
+  type ScriptedMove,
+} from './fixtures.ts';
 
 const PIECE_VALUE: Record<string, number> = { p: 100, n: 320, b: 330, r: 500, q: 900, k: 0 };
 
@@ -186,9 +192,12 @@ export function candidatesFor(fen: string, count = 3): Candidate[] {
 function classify(delta: number, isBest: boolean): Classification {
   if (delta <= -0.3) return 'blunder';
   if (delta <= -0.2) return 'mistake';
-  if (delta <= -0.1) return 'inaccuracy';
+  // -0.07 / -0.03 rather than Lichess's -0.10 / -0.02: see §8.3 "Calibration".
+  // These have to track `crates/core/src/classify.rs`, or the mock UI shows
+  // verdicts the real server would not.
+  if (delta <= -0.07) return 'inaccuracy';
   if (isBest) return 'best';
-  if (delta > -0.02) return 'excellent';
+  if (delta > -0.03) return 'excellent';
   return 'good';
 }
 
@@ -231,6 +240,33 @@ export function analysisFor(
 
   const parent = node.parent === null ? null : nodeById(tree, node.parent);
   let context: AnalysisContext | null = null;
+
+  if (parent && node.san && node.uci && isBookPath(sanPathTo(tree, nodeId))) {
+    // The book runs before the engine, so a theoretical move has no candidates,
+    // no counterfactual and no win probabilities — `pipeline::book_context`
+    // fills the numbers with placeholders and the UI must not plot them.
+    return {
+      fen: node.fen,
+      depth: 18,
+      candidates: [],
+      context: {
+        candidates: [],
+        played_rank: null,
+        played: {
+          san: node.san,
+          uci: node.uci,
+          win_prob_before: 0.5,
+          win_prob_after: 0.5,
+          delta: 0,
+          classification: 'book',
+          accuracy: 100,
+        },
+        counterfactual: null,
+        static_diff: staticDiff(parent.fen, node.fen),
+      },
+      explanations,
+    };
+  }
 
   if (parent && node.san && node.uci) {
     const scripted = findScripted(nodeId);
@@ -280,6 +316,72 @@ export function analysisFor(
   }
 
   return { fen: node.fen, depth: 18, candidates, context, explanations };
+}
+
+/**
+ * The shallowest depth `/analyze` streams, mirroring `MIN_STREAM_DEPTH` in
+ * `crates/engine/src/lib.rs`. Nothing below it ever reaches a client, so the
+ * mock must not send it either.
+ */
+const MIN_STREAM_DEPTH = 6;
+
+/** One `candidates` event: a depth and the ranking as it stood there. */
+export interface StreamedDepth {
+  depth: number;
+  candidates: Candidate[];
+  /** Milliseconds after the request that this iteration finished. */
+  at: number;
+}
+
+/**
+ * A plausible narration of the search that produced `final`.
+ *
+ * The mock has no iterative deepening to report — `candidatesFor` computes one
+ * answer — so the sequence is synthesised, and it is synthesised to have the two
+ * properties that matter for exercising the client rather than to be realistic
+ * chess:
+ *
+ * 1. **The arrival times accelerate the way a real search's do.** Measured
+ *    against Stockfish 18 at depth 12 / MultiPV 5, completed depths land at
+ *    roughly 6, 22, 94 and 289 ms — the early ones bunched, the late ones spread.
+ *    That shape is what `PARTIAL_MIN_INTERVAL_MS` in `state/useSession.ts` is
+ *    calibrated against, so a mock that emitted evenly would silently stop
+ *    testing the throttle.
+ * 2. **The ranking changes on the way up.** The shallowest depth has the top two
+ *    swapped and every score pulled toward equality, so the client's reordering
+ *    and re-weighting paths actually run. A mock that repeated the final answer
+ *    at four depths would look identical on screen and test nothing.
+ *
+ * A position with no candidates (checkmate, stalemate) narrates nothing, exactly
+ * as the real server sends no `candidates` for a terminal position.
+ */
+export function streamedDepths(final: Candidate[]): StreamedDepth[] {
+  if (final.length === 0) return [];
+
+  const schedule: { depth: number; at: number }[] = [
+    { depth: MIN_STREAM_DEPTH, at: 40 },
+    { depth: 8, at: 75 },
+    { depth: 10, at: 150 },
+    { depth: 12, at: 260 },
+  ];
+
+  return schedule.map(({ depth, at }, step) => {
+    // How settled this iteration is: 0 at the first, 1 at the last.
+    const settled = step / (schedule.length - 1);
+    const ranked = step === 0 && final.length > 1
+      ? [final[1]!, final[0]!, ...final.slice(2)]
+      : final;
+    return {
+      depth,
+      at,
+      candidates: ranked.map((candidate) => {
+        if (candidate.score.kind !== 'cp') return candidate;
+        // Shallow searches have not yet found the evaluation's extremes.
+        const score: Score = { kind: 'cp', value: Math.round(candidate.score.value * settled) };
+        return { ...candidate, score, win_prob: scoreToWinProb(score) };
+      }),
+    };
+  });
 }
 
 /** Candidates for a position, with a hand-written mate score where we have one. */

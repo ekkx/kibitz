@@ -96,11 +96,11 @@ export interface PositionAnalysis {
  * server binary. Offline and always present, so there is no request, no loading
  * state and no failure mode for the UI to handle.
  *
- * It is a *name for the position*, and nothing more. It says nothing about
- * whether the move is still theory — that judgement needs the game counts of an
- * opening explorer, which an ECO table does not carry — so it must never be
- * rendered as "book" / "out of book". A line simply stops having a name at some
- * depth, which is not the same thing as leaving theory.
+ * It is a *name for the position*, and nothing more, so it must never be
+ * rendered as "book" / "out of book". Whether the move is still theory arrives
+ * separately, as `classification: "book"` on the move itself, and the two do not
+ * agree move for move: a line stops having a name at some depth, which is not
+ * the same thing as leaving theory, and most book moves carry no name at all.
  */
 export interface OpeningInfo {
   eco: string; // "C65"
@@ -154,6 +154,22 @@ export interface LanguagesResponse {
 }
 
 /* ---- SSE event payloads ---- */
+
+/**
+ * `POST /analyze`'s `candidates` event: the engine's ranking at one completed
+ * depth, while the search is still running.
+ *
+ * **A ranking, never a verdict.** API.md is explicit that this event carries a
+ * depth and a candidate list and nothing else — no classification, no accuracy,
+ * no counterfactual — because those come from comparing two searches against
+ * thresholds and would flicker between categories as the depth climbs. The type
+ * is written narrow on purpose: if a field ever needs adding here, that is the
+ * moment to re-read `pipeline::analyze_node_streaming` rather than to widen it.
+ */
+export interface AnalyzeCandidatesEvent {
+  depth: number;
+  candidates: Candidate[];
+}
 
 export interface SweepProgressEvent {
   node_id: number;

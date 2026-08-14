@@ -153,6 +153,115 @@ export function terminalScore(fen: string): { kind: 'mate'; value: 0 } | { kind:
   return chess.isCheckmate() ? { kind: 'mate', value: 0 } : { kind: 'cp', value: 0 };
 }
 
+/* ---- material ---- */
+
+/** The five capturable roles, in the order a captured-piece row lists them. */
+export const CAPTURE_ORDER = ['pawn', 'knight', 'bishop', 'rook', 'queen'] as const;
+
+export type PieceRole = (typeof CAPTURE_ORDER)[number];
+
+/** Some number of one role, taken by one player. */
+export interface CapturedGroup {
+  role: PieceRole;
+  count: number;
+}
+
+export interface Material {
+  /** What White has taken: the Black pieces missing from the board. */
+  whiteCaptured: CapturedGroup[];
+  blackCaptured: CapturedGroup[];
+  /**
+   * White's lead in pawns, counted from the pieces still on the board.
+   * Negative when Black leads, zero when material is level.
+   */
+  advantage: number;
+}
+
+const ROLE_OF: Record<string, PieceRole> = {
+  p: 'pawn',
+  n: 'knight',
+  b: 'bishop',
+  r: 'rook',
+  q: 'queen',
+};
+
+/** How many of each role a side starts with. Kings are never captured. */
+const STARTING: Record<PieceRole, number> = {
+  pawn: 8,
+  knight: 2,
+  bishop: 2,
+  rook: 2,
+  queen: 1,
+};
+
+/** The values everyone counts material in. Deliberately the plain ones. */
+const VALUE: Record<PieceRole, number> = {
+  pawn: 1,
+  knight: 3,
+  bishop: 3,
+  rook: 5,
+  queen: 9,
+};
+
+/**
+ * Who has taken what, and who is ahead, read off the position itself.
+ *
+ * Derived from the FEN rather than tracked through the game, because the FEN is
+ * the one thing that is always true about the board on screen: it is right for
+ * a position reached by stepping, by jumping to move 34, by branching into a
+ * variation the game never contained, and — the case that decides it — for a
+ * counterfactual line being replayed, where there is no game history to consult
+ * because those moves were never played.
+ *
+ * **Captures are inferred, and the advantage is not.** A missing Black knight
+ * means White took a knight; there is no other way for it to leave. Promotion
+ * breaks that inference in one direction only: a side can field two queens, and
+ * subtracting from a starting set of one would report a *negative* number of
+ * captured queens. That is clamped to zero, so the captured row degrades to "at
+ * least these" rather than to nonsense — a promoted queen simply stops the row
+ * claiming a pawn was taken that was not.
+ *
+ * The advantage is computed the other way round, from what is *on* the board,
+ * so promotion costs it nothing: a promoted queen is worth nine to the side
+ * that owns it, exactly as it is in the game. That is why these two numbers are
+ * not derived from each other, and why the row and the `+N` can disagree in a
+ * position with two queens on it. The `+N` is the one that is exactly right.
+ *
+ * An unreadable FEN yields empty rows and a level score — the strips render as
+ * two names and nothing else, which is the correct amount to say about a
+ * position that could not be read.
+ */
+export function material(fen: string): Material {
+  const board = fen.split(' ')[0] ?? '';
+  const empty: Material = { whiteCaptured: [], blackCaptured: [], advantage: 0 };
+  if (!/^[pnbrqkPNBRQK1-8/]+$/.test(board)) return empty;
+
+  const counts = {
+    white: { pawn: 0, knight: 0, bishop: 0, rook: 0, queen: 0 },
+    black: { pawn: 0, knight: 0, bishop: 0, rook: 0, queen: 0 },
+  };
+  for (const character of board) {
+    const role = ROLE_OF[character.toLowerCase()];
+    if (!role) continue;
+    counts[character === character.toUpperCase() ? 'white' : 'black'][role] += 1;
+  }
+
+  const taken = (remaining: Record<PieceRole, number>): CapturedGroup[] =>
+    CAPTURE_ORDER.map((role) => ({
+      role,
+      count: Math.max(0, STARTING[role] - remaining[role]),
+    })).filter((group) => group.count > 0);
+
+  const value = (side: Record<PieceRole, number>): number =>
+    CAPTURE_ORDER.reduce((total, role) => total + side[role] * VALUE[role], 0);
+
+  return {
+    whiteCaptured: taken(counts.black),
+    blackCaptured: taken(counts.white),
+    advantage: value(counts.white) - value(counts.black),
+  };
+}
+
 export function uciToSquares(uci: string | null | undefined): [Key, Key] | undefined {
   if (!uci || uci.length < 4) return undefined;
   return [uci.slice(0, 2) as Key, uci.slice(2, 4) as Key];

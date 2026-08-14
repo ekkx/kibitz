@@ -127,13 +127,67 @@ impl Pipeline {
         node: NodeId,
         depth: Option<u8>,
     ) -> Result<PositionAnalysis, PipelineError> {
+        self.analyze_node_streaming(tree, node, depth, |_| {}).await
+    }
+
+    /// [`Pipeline::analyze_node`], reporting the node's own ranking as the search
+    /// deepens.
+    ///
+    /// ## Candidates stream; the verdict does not
+    ///
+    /// **This is the line, and this is the only place it is drawn.** `on_partial`
+    /// receives a [`kibitz_engine::DepthUpdate`] — a depth and the ranked moves at
+    /// that depth. Nothing else. It never receives a [`Classification`], an
+    /// accuracy, a `delta` or a [`Counterfactual`], and a later change here must
+    /// not add one.
+    ///
+    /// The reason is not cost, it is *kind*. A ranking is the same sort of claim
+    /// at every depth and merely gets sharper: "these are the moves worth
+    /// considering, and this is roughly what they are worth". A classification is
+    /// a different sort of claim — it is the output of *comparing* two searches
+    /// against thresholds ([`classify`]), and thresholds have no notion of
+    /// "approximately". Measured on this repository's own test games, the top
+    /// move's win probability moves by more than a centi-probability on a fifth
+    /// of all iterations even past depth 8, which is more than enough to carry a
+    /// move across the `Blunder`/`Mistake`/`Inaccuracy` boundaries. A badge that
+    /// reads `Blunder`, then `Good`, then `Inaccuracy` while the user watches has
+    /// not told them anything three times; it has told them that the tool does
+    /// not know, which costs more trust than the latency saved buys back.
+    ///
+    /// So a partial carries what a board can draw honestly at any depth — arrows
+    /// and a candidate list — and the judgement waits for the depth it was
+    /// calibrated at.
+    ///
+    /// Two further consequences worth stating, because they are easy to undo by
+    /// accident:
+    ///
+    /// - **Only the node's own search is streamed.** The parent's search, which
+    ///   runs afterwards purely to classify the move played, is not: nothing it
+    ///   produces is drawn before the verdict is complete, so narrating it would
+    ///   be narrating work with no visible half-answer.
+    /// - **Only the final result is cached.** Partials are never written to the
+    ///   store — see [`Pipeline::search_streaming`] — because a cache entry is
+    ///   read back as a finished search, and half of one would be served to a
+    ///   later request as though it were whole.
+    pub async fn analyze_node_streaming<F>(
+        &self,
+        tree: &GameTree,
+        node: NodeId,
+        depth: Option<u8>,
+        on_partial: F,
+    ) -> Result<PositionAnalysis, PipelineError>
+    where
+        F: FnMut(kibitz_engine::DepthUpdate),
+    {
         let depth = depth.unwrap_or(self.depth);
         let node_ref = tree.get(node).ok_or(PipelineError::NodeNotFound(node))?;
         let pos = tree
             .position(node)
             .map_err(|e| PipelineError::Position(e.to_string()))?;
 
-        let here = self.search(&pos, depth, self.multipv).await?;
+        let here = self
+            .search_streaming(&pos, depth, self.multipv, on_partial)
+            .await?;
 
         let Some(parent) = node_ref.parent else {
             return Ok(PositionAnalysis {
@@ -156,7 +210,11 @@ impl Pipeline {
                 // The book is an optimisation, not a dependency. Losing the
                 // Explorer API (offline, rate limited, down) must not take the
                 // whole analysis with it — the move is simply treated as out of
-                // book and goes through the engine like any other.
+                // book and goes through the engine like any other. This stays
+                // true now that `judge` has an offline fallback: the fallback
+                // answers where the Explorer is merely unavailable, and a real
+                // failure still arrives here as an `Err` and degrades to
+                // "no book".
                 match book.judge(&before, &uci).await {
                     Ok(verdict) => verdict,
                     Err(e) => {
@@ -352,6 +410,33 @@ impl Pipeline {
         depth: u8,
         multipv: usize,
     ) -> Result<SearchResult, PipelineError> {
+        self.search_streaming(pos, depth, multipv, |_| {}).await
+    }
+
+    /// [`Pipeline::search`], reporting each completed iteration as it lands.
+    ///
+    /// Everything that answers *without* running a search answers silently: a
+    /// terminal position and a cache hit both produce their result in one step,
+    /// and there is no intermediate state for a client to draw. That is the
+    /// behaviour a caller wants — a cached node should snap into place, not
+    /// pretend to think about it.
+    ///
+    /// **Partials never reach the store.** Only the finished [`SearchResult`] is
+    /// written, at the same point [`Pipeline::search`] always wrote it. The cache
+    /// is keyed on `(fen, depth, multipv, engine)` and read back as a completed
+    /// search of that depth; an entry holding depth 8's ranking under depth 12's
+    /// key would be handed to every later request — including a sweep, where it
+    /// would silently corrupt the `delta` between two adjacent positions.
+    pub async fn search_streaming<F>(
+        &self,
+        pos: &Chess,
+        depth: u8,
+        multipv: usize,
+        on_partial: F,
+    ) -> Result<SearchResult, PipelineError>
+    where
+        F: FnMut(kibitz_engine::DepthUpdate),
+    {
         if let Some(terminal) = terminal_of(pos) {
             return Ok(SearchResult {
                 fen: fen_of(pos),
@@ -374,7 +459,10 @@ impl Pipeline {
         {
             return Ok(hit);
         }
-        let result = self.engine.analyze(pos, Some(depth)).await?;
+        let result = self
+            .engine
+            .analyze_streaming(pos, Some(depth), on_partial)
+            .await?;
         drop(permit);
         self.cache_put(&key, depth, multipv, &result);
         Ok(result)
@@ -506,22 +594,40 @@ pub fn classify_input(
     }
 }
 
-/// The alternative whose collapse gets shown for a good move: the second-best
-/// candidate, or — when the move played *is* the second-best — the next distinct
-/// one, falling back to the best move.
+/// The alternative whose collapse gets shown for a good move: **the best move,
+/// unless the best move is the one that was played**, in which case the
+/// second-best.
+///
+/// The two cases are asking two different questions, and only the first one used
+/// to be answered.
+///
+/// When the played move *is* rank 0 there is no better move to point at, so the
+/// only thing left to show is the runner-up — "here is how the second-best
+/// collapses, which is why yours was better". That is the case this function was
+/// originally written for, and it is unchanged.
+///
+/// When the played move is anything else, the question the reader is asking is
+/// not "what would the runner-up have done" — they did not play the runner-up
+/// either. They want the move they should have played. Skipping rank 0 to hand a
+/// player of the third-best move the *second*-best line answers a question
+/// nobody asked, and in a position where rank 0 is the point of the whole
+/// position it hides exactly the move worth seeing. This holds for a move that
+/// missed the candidate list entirely (`played_rank == None`) for the same
+/// reason.
 pub fn alternative<'a>(candidates: &'a [Candidate], played_uci: &str) -> Option<&'a Candidate> {
-    candidates
-        .iter()
-        .skip(1)
-        .find(|c| c.uci != played_uci)
-        .or_else(|| candidates.first().filter(|c| c.uci != played_uci))
+    let best = candidates.first()?;
+    if best.uci != played_uci {
+        return Some(best);
+    }
+    candidates.iter().skip(1).find(|c| c.uci != played_uci)
 }
 
 /// Which line the board replays, and the position it starts from.
 ///
 /// Bad move -> how the opponent punishes what was played, starting **after** the
-/// move. Good move -> how things collapse if the second-best move is played
-/// instead, starting **before** it. Motif detection is layered on top by
+/// move. Good move -> how things collapse if [`alternative`] is played instead,
+/// starting **before** it: the best move when the player did not find it, the
+/// second-best when they did. Motif detection is layered on top by
 /// [`counterfactual`]; keeping the choice separate makes it testable on its own.
 pub fn counterfactual_line(
     classification: Classification,
@@ -926,21 +1032,70 @@ mod tests {
     }
 
     #[test]
-    fn alternative_skips_the_move_actually_played() {
+    fn alternative_is_the_second_best_only_when_the_best_was_played() {
         let cands = vec![
             candidate("e2e4", "e4", Score::Cp(50), &["e4"]),
             candidate("d2d4", "d4", Score::Cp(40), &["d4"]),
             candidate("g1f3", "Nf3", Score::Cp(30), &["Nf3"]),
         ];
-        // Played the best move: the collapse to show is the second best.
+        // Played the best move: there is no better move to point at, so the
+        // collapse to show is the runner-up's.
         assert_eq!(alternative(&cands, "e2e4").unwrap().uci, "d2d4");
-        // Played the second best: skip to the next distinct one.
-        assert_eq!(alternative(&cands, "d2d4").unwrap().uci, "g1f3");
-        // Played something outside the list: still the second best.
-        assert_eq!(alternative(&cands, "a2a3").unwrap().uci, "d2d4");
-        // Nothing to compare against.
-        assert!(alternative(&cands[..1], "e2e4").is_none());
+        assert_eq!(alternative(&cands[..2], "e2e4").unwrap().uci, "d2d4");
+    }
+
+    /// The other branch: the player did not find rank 0, so rank 0 is precisely
+    /// what they want to be shown — never the move one rung above their own.
+    #[test]
+    fn alternative_is_the_best_move_whenever_it_was_not_played() {
+        let cands = vec![
+            candidate("e2e4", "e4", Score::Cp(50), &["e4"]),
+            candidate("d2d4", "d4", Score::Cp(40), &["d4"]),
+            candidate("g1f3", "Nf3", Score::Cp(30), &["Nf3"]),
+        ];
+        // Played the second best.
+        assert_eq!(alternative(&cands, "d2d4").unwrap().uci, "e2e4");
+        // Played the third best — the case that used to show the *second* best.
+        assert_eq!(alternative(&cands, "g1f3").unwrap().uci, "e2e4");
+        // Played something outside the candidate list at all.
+        assert_eq!(alternative(&cands, "a2a3").unwrap().uci, "e2e4");
+        // A single candidate is still the best move when it was not played.
+        assert_eq!(alternative(&cands[..1], "a2a3").unwrap().uci, "e2e4");
+    }
+
+    #[test]
+    fn no_alternative_when_there_is_nothing_left_to_show() {
+        let cands = vec![candidate("e2e4", "e4", Score::Cp(50), &["e4"])];
+        // The only candidate is the move played: nothing to compare against.
+        assert!(alternative(&cands, "e2e4").is_none());
         assert!(alternative(&[], "e2e4").is_none());
+    }
+
+    /// The counterfactual line follows [`alternative`] through, so playing a
+    /// mid-ranked move replays the best move's line and not the runner-up's.
+    #[test]
+    fn a_non_best_move_replays_the_best_moves_line() {
+        let before = Chess::default();
+        let after = play(&before, "Nf3");
+        let before_search = search(vec![
+            candidate("e2e4", "e4", Score::Cp(50), &["e4", "e5", "Nf3"]),
+            candidate("d2d4", "d4", Score::Cp(40), &["d4", "d5"]),
+            candidate("g1f3", "Nf3", Score::Cp(30), &["Nf3", "Nf6"]),
+        ]);
+        let after_search = search(vec![candidate("g8f6", "Nf6", Score::Cp(-25), &["Nf6"])]);
+
+        let (kind, start_fen, pv) = counterfactual_line(
+            Classification::Good,
+            &before,
+            &after,
+            "g1f3",
+            &before_search,
+            &after_search,
+        )
+        .unwrap();
+        assert_eq!(kind, CounterfactualKind::AlternativeCollapse);
+        assert_eq!(start_fen, fen_of(&before));
+        assert_eq!(pv, ["e4", "e5", "Nf3"], "the best move's line, not d4's");
     }
 
     #[test]

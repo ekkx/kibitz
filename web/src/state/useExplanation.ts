@@ -18,8 +18,6 @@ export interface ExplanationInput {
   nodeId: number | null;
   /** Explanation language — the `lang` request parameter, not the UI language. */
   lang: string;
-  /** Whether to fetch without being asked (notable moves only). */
-  auto: boolean;
   /** An explanation the analysis already carried for this language. */
   preloaded?: string | undefined;
 }
@@ -30,12 +28,28 @@ export interface ExplanationInput {
  * Text arrives as `delta` events and is appended as it comes, so the panel
  * fills in while the counterfactual replays on the board — the two together
  * are the moment the tool is built around.
+ *
+ * **Nothing here ever starts a generation on its own.** `request` is the only
+ * path to the network, and it is reached from one button. This used to have an
+ * `auto` flag that fired on notable moves, and the flag was wrong twice over: a
+ * generation costs money and several seconds of somebody else's compute, so
+ * spending it on a position the user merely arrowed past is a decision they did
+ * not make — and because it fired from an effect keyed on the node, holding the
+ * arrow key down through a game full of mistakes started and aborted a request
+ * per ply. Text appearing without a press was indistinguishable from the app
+ * misbehaving, which is exactly what it was.
+ *
+ * The effect below therefore only ever *shows* text, never fetches it: an
+ * explanation the analysis already carried for this language appears instantly
+ * and is marked cached, and everything else is `idle` until the button is
+ * pressed. Changing language or node re-reads that cache and abandons any
+ * stream still arriving for the position that was left, which is the one thing
+ * that must still happen without being asked.
  */
 export function useExplanation({
   sessionId,
   nodeId,
   lang,
-  auto,
   preloaded,
 }: ExplanationInput): ExplanationState {
   const [text, setText] = useState('');
@@ -94,11 +108,10 @@ export function useExplanation({
     setStatus(preloaded ? 'done' : 'idle');
     setCached(Boolean(preloaded));
     setError(null);
-    if (!preloaded && auto) run();
     return () => controllerRef.current?.abort();
     // `preloaded` is derived from the same node/lang pair, so this list is complete.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, nodeId, lang, auto, run]);
+  }, [sessionId, nodeId, lang]);
 
   return { text, status, cached, model, error, request: run };
 }

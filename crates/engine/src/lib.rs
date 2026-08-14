@@ -16,6 +16,7 @@ use shakmaty::Chess;
 pub mod uci;
 
 mod driver;
+mod progress;
 
 use driver::{Request, RequestKind, SearchSpec};
 
@@ -59,9 +60,11 @@ pub const DEFAULT_DEPTH: u8 = 12;
 ///    it, and `classify`'s "only move" test compares exactly those two. Re-running
 ///    `testdata/opera_game.pgn` at depth 12 moved 9 of 33 verdicts between width 3
 ///    and width 5 (`Qb3` best -> great, `O-O-O` great -> best, `Bxd7` mistake ->
-///    inaccuracy, and so on). The landmark verdicts are stable — `Nxb5` and
-///    `Bxb5+` stay great, `Nxd7` a blunder — but the neighbourhood of a
-///    threshold is not. A client-chosen width would therefore mean two users
+///    inaccuracy, and so on) — the neighbourhood of a threshold is not stable.
+///    That run predates the `GREAT_GAP` calibration, which took five of that
+///    game's six `Great`s away entirely; `Nxd7` is still a blunder, and the one
+///    surviving `Great`, `Qb8+`, is awarded by the mate route, which does not
+///    read the gap this width perturbs. A client-chosen width would therefore mean two users
 ///    seeing different judgements of the same game, and a settings toggle quietly
 ///    rewriting the move list. The server picks one width for everyone.
 ///
@@ -108,6 +111,38 @@ impl Default for EngineConfig {
     }
 }
 
+/// The shallowest iteration [`Engine::analyze_streaming`] will report.
+///
+/// Every completed depth below this one is dropped, and the choice is a trade
+/// between how soon the first answer appears and how much of it is about to be
+/// withdrawn. Measured over the 73 positions of `testdata/opera_game.pgn` and
+/// `testdata/ruy_lopez_chigorin.pgn` at [`DEFAULT_DEPTH`] and
+/// [`DEFAULT_MULTIPV`], 9 threads:
+///
+/// | depth | 1 | 3 | 5 | **6** | 8 | 10 | 12 |
+/// |---|---|---|---|---|---|---|---|
+/// | arrives (median) | 0.9ms | 2.2ms | 3.8ms | **5.8ms** | 22ms | 88ms | 289ms |
+/// | top move's win prob moves ≥0.01 next iteration | 74% | 53% | 43% | **18%** | 25% | 12% | — |
+///
+/// Two things fall out of that table, and they point at the same place.
+///
+/// Depths 1 to 5 are not early, they are *simultaneous*: all five land inside
+/// the first four milliseconds, which is a quarter of one 60Hz frame. Reporting
+/// them buys no visible information at all and costs the client five renders
+/// before it has painted once.
+///
+/// They are also the least true. The threshold in that second row is the
+/// client's own: `web/src/ui/arrows.ts` treats two moves as equal when their win
+/// probabilities are within 0.01, so a step that large is a step that can
+/// re-rank the arrows. Below depth 6 the search moves the top move by that much
+/// on roughly half of all iterations; from 6 on it is under a fifth.
+///
+/// Six is where those two curves cross, and it still arrives in single-digit
+/// milliseconds against a full search of 289. Eight would halve the redraws but
+/// costs four times the wait for the first one (22ms), which is the wrong side
+/// of the trade for the only thing this feature exists to improve.
+pub const MIN_STREAM_DEPTH: u8 = 6;
+
 /// How much deeper than `EngineConfig::depth` [`Engine::long_pv`] searches when
 /// no depth is given. `StrategicOutlook` wants 10-12 ply of principal variation,
 /// which a MultiPV=3 search at the normal depth rarely produces.
@@ -122,6 +157,20 @@ pub struct SearchResult {
     pub candidates: Vec<Candidate>,
     /// Set when the position was already over.
     pub terminal: Option<Terminal>,
+}
+
+/// One finished iteration of a search that is still running.
+///
+/// This is deliberately **not** a `SearchResult`. A `SearchResult` is an answer;
+/// this is a progress report, and the type says so, so that no caller can hand a
+/// half-finished search to something expecting a finished one.
+#[derive(Debug, Clone)]
+pub struct DepthUpdate {
+    /// The iteration that produced these candidates. Monotone within one search.
+    pub depth: u8,
+    /// MultiPV results at that depth, `[0]` best — the same shape and ordering
+    /// [`SearchResult::candidates`] has.
+    pub candidates: Vec<Candidate>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,11 +254,49 @@ impl Engine {
         pos: &Chess,
         depth: Option<u8>,
     ) -> Result<SearchResult, EngineError> {
+        // The non-streaming path is the streaming one with nobody listening.
+        // Keeping it as a delegation rather than a copy is what stops the two
+        // from drifting: there is one place where a `SearchSpec` for a MultiPV
+        // analysis is built, and one place that decides a position is terminal.
+        self.analyze_streaming(pos, depth, |_| {}).await
+    }
+
+    /// [`Engine::analyze`], reporting each completed iteration as it lands.
+    ///
+    /// `on_depth` is called once per finished depth at or above
+    /// [`MIN_STREAM_DEPTH`], with the ranking as it stood at that depth, and then
+    /// the finished [`SearchResult`] is returned exactly as [`Engine::analyze`]
+    /// would return it. It is **not** called for a cached, terminal or cancelled
+    /// search: a terminal position never reaches the engine, and a superseded one
+    /// never finished an iteration it was willing to stand behind.
+    ///
+    /// The callback runs on this task, between polls of the search, so it must
+    /// not block — it is meant for handing the update to a channel.
+    ///
+    /// **A partial is a ranking, never a judgement.** What arrives here is "these
+    /// are the moves and this is what they are worth at depth N", which is the
+    /// same kind of thing at every depth and merely gets sharper. Anything
+    /// derived by *comparing* two searches — how good the move played was, what
+    /// it cost, what would have refuted it — is not in this type and must not be
+    /// computed from it. Those answers change category as they sharpen, not just
+    /// precision: a move can read `Blunder` at depth 6 and `Good` at depth 12,
+    /// and a verdict that flickers costs more trust than the latency buys back.
+    /// See `crates/server/src/pipeline.rs` for where that line is drawn.
+    pub async fn analyze_streaming<F>(
+        &self,
+        pos: &Chess,
+        depth: Option<u8>,
+        mut on_depth: F,
+    ) -> Result<SearchResult, EngineError>
+    where
+        F: FnMut(DepthUpdate),
+    {
         let depth = depth.unwrap_or(self.inner.config.depth);
         let fen = position::fen(pos);
 
         // Terminal positions never reach the engine: `bestmove (none)` carries no
-        // score and no PV, so there would be nothing to parse anyway.
+        // score and no PV, so there would be nothing to parse anyway. There is
+        // also nothing to stream — the answer is known before any search starts.
         if let Some(terminal) = position::terminal(pos) {
             return Ok(SearchResult {
                 fen,
@@ -219,14 +306,36 @@ impl Engine {
             });
         }
 
-        let outcome = self
-            .search(SearchSpec {
-                fen: fen.clone(),
-                depth,
-                multipv: self.inner.config.multipv.max(1),
-                searchmoves: None,
-            })
-            .await?;
+        let (progress, mut updates) = tokio::sync::mpsc::unbounded_channel();
+        let search = self.search(SearchSpec {
+            fen: fen.clone(),
+            depth,
+            multipv: self.inner.config.multipv.max(1),
+            searchmoves: None,
+            progress: Some(progress),
+        });
+        tokio::pin!(search);
+
+        let mut listening = true;
+        let outcome = loop {
+            tokio::select! {
+                // Biased, with the commentary first. The driver sends the last
+                // iteration and *then* answers the request, so both branches are
+                // ready at once at the end of every search; an unbiased select
+                // would drop that final update half the time.
+                biased;
+                closed = updates.recv(), if listening => match closed {
+                    Some(closed) => report(pos, closed, &mut on_depth),
+                    None => listening = false,
+                },
+                outcome = &mut search => break outcome?,
+            }
+        };
+
+        // Whatever the driver sent between the last poll above and its reply.
+        while let Ok(closed) = updates.try_recv() {
+            report(pos, closed, &mut on_depth);
+        }
 
         Ok(SearchResult {
             fen,
@@ -262,6 +371,7 @@ impl Engine {
                 depth,
                 multipv: 1,
                 searchmoves: Some(normalized),
+                progress: None,
             })
             .await?;
 
@@ -296,6 +406,7 @@ impl Engine {
                 depth,
                 multipv: 1,
                 searchmoves: None,
+                progress: None,
             })
             .await?;
 
@@ -327,6 +438,32 @@ impl Engine {
         // A dropped reply channel means the task died mid-flight. Never a hang.
         answer.await.map_err(|_| EngineError::Died)?
     }
+}
+
+/// Hand one finished iteration to a streaming caller, unless it is too shallow
+/// to be worth drawing ([`MIN_STREAM_DEPTH`]) or produced nothing playable.
+///
+/// The floor is applied here, on the way out, rather than inside the tracker: the
+/// tracker's job is to say what the engine finished, and what is worth showing is
+/// a separate question with a separate answer.
+fn report<F: FnMut(DepthUpdate)>(
+    pos: &Chess,
+    closed: progress::CompletedDepth,
+    on_depth: &mut F,
+) {
+    if closed.depth < MIN_STREAM_DEPTH {
+        return;
+    }
+    let candidates = position::candidates(pos, &closed.infos);
+    // An iteration whose every PV was unplayable is not an empty ranking, it is
+    // no ranking — and drawing it would clear the arrows mid-search.
+    if candidates.is_empty() {
+        return;
+    }
+    on_depth(DepthUpdate {
+        depth: closed.depth,
+        candidates,
+    });
 }
 
 #[derive(Debug, thiserror::Error)]

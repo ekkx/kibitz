@@ -1,7 +1,8 @@
 import { runExclusive } from './engineQueue.ts';
 import { parseEventData, readSseStream } from './sse.ts';
-import { apiFetch, raiseForStatus } from './transport.ts';
+import { ApiError, apiFetch, raiseForStatus } from './transport.ts';
 import type {
+  AnalyzeCandidatesEvent,
   ErrorEvent as ApiErrorEvent,
   ExplainDeltaEvent,
   ExplainDoneEvent,
@@ -62,14 +63,107 @@ export const play = (
   body: { node_id: number } & ({ uci: string } | { san: string }),
 ) => postJson<PlayResponse>(`/sessions/${id}/play`, body);
 
-/** `depth` is required here on purpose — see the note above `getJson`. */
-export const analyze = (
+/* ---------- SSE endpoints ---------- */
+
+export interface AnalyzeHandlers {
+  /**
+   * The engine's ranking at one completed depth, while the search runs.
+   *
+   * Called zero or more times, with a strictly increasing `depth`, before the
+   * promise resolves. Zero times when there was no search to narrate — a cached
+   * position or a terminal one, both of which answer in a single event.
+   *
+   * **Draw the ranking; do not infer a verdict from it.** See API.md: the
+   * classification, the accuracy and the counterfactual are deliberately absent
+   * from this payload and belong to the resolved `PositionAnalysis` alone.
+   */
+  onCandidates?: (event: AnalyzeCandidatesEvent) => void;
+}
+
+/**
+ * `POST .../analyze` — SSE, resolving with the finished `PositionAnalysis`.
+ *
+ * The resolved value is exactly what this call used to return when the endpoint
+ * was plain JSON, so every caller that ignores `handlers` behaves as it did.
+ *
+ * **Errors come in two shapes and both land here as an `ApiError`.** A failure
+ * the server could see before the response began is a real HTTP status
+ * (`404`, `503`, …) and is raised by `raiseForStatus`. A failure *during* the
+ * search cannot be — the `200` has already gone out — so it arrives as an
+ * `error` event, and this function turns it back into the `ApiError` the status
+ * would have produced. That is what keeps `error.isCancelled` meaningful for
+ * callers: a superseded analysis reads the same whether it was rejected before
+ * the stream opened or stopped halfway through it.
+ *
+ * `depth` is required on purpose — see the note above `getJson`.
+ */
+export async function analyze(
   id: string,
   body: { node_id: number; depth: number },
+  handlers: AnalyzeHandlers = {},
   signal?: AbortSignal,
-) => postJson<PositionAnalysis>(`/sessions/${id}/analyze`, body, signal);
+): Promise<PositionAnalysis> {
+  const res = await apiFetch(`${BASE}/sessions/${id}/analyze`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    body: JSON.stringify(body),
+    signal: signal ?? null,
+  });
+  await raiseForStatus(res);
 
-/* ---------- SSE endpoints ---------- */
+  let analysis: PositionAnalysis | null = null;
+  let failure: ApiError | null = null;
+
+  await readSseStream(
+    res,
+    (ev) => {
+      switch (ev.event) {
+        case 'candidates': {
+          // A partial that arrives after the verdict, or after a failure, is a
+          // straggler from a stream that is already over. Nothing good comes of
+          // walking the board backwards to render it.
+          if (analysis || failure) break;
+          const data = parseEventData<AnalyzeCandidatesEvent>(ev.data);
+          if (data) handlers.onCandidates?.(data);
+          break;
+        }
+        case 'analysis': {
+          const data = parseEventData<PositionAnalysis>(ev.data);
+          if (data) analysis = data;
+          break;
+        }
+        case 'error': {
+          const data = parseEventData<ApiErrorEvent>(ev.data);
+          failure = streamError(data?.error ?? 'unknown error');
+          break;
+        }
+        default:
+          break;
+      }
+    },
+    signal,
+  );
+
+  if (failure) throw failure;
+  if (!analysis) {
+    // The connection ended without either outcome: the server died, a proxy cut
+    // the body, or the browser dropped it. Silently resolving with nothing would
+    // leave the panel stuck on "analysing" forever.
+    throw new Error('the analysis stream ended without a result');
+  }
+  return analysis;
+}
+
+/**
+ * Rebuild the HTTP error an `error` event stands in for.
+ *
+ * `cancelled` is the one the client acts on, and it maps back to the `409` this
+ * endpoint used to answer with, so `ApiError.isCancelled` keeps working
+ * unchanged. Anything else was a `500` before it was an event.
+ */
+function streamError(message: string): ApiError {
+  return new ApiError(message === 'cancelled' ? 409 : 500, message);
+}
 
 export interface SweepHandlers {
   onProgress?: (e: SweepProgressEvent) => void;

@@ -200,24 +200,83 @@ struct AnalyzeRequest {
     depth: Option<u8>,
 }
 
+/// Analyse one node, streaming the ranking as the search deepens.
+///
+/// Two events, and the names are load-bearing:
+///
+/// - `candidates` — the ranked moves at one completed depth. A **ranking**, and
+///   nothing else. It carries no classification, no accuracy and no
+///   counterfactual, and `pipeline::analyze_node_streaming` explains at length
+///   why it must not grow one.
+/// - `analysis` — the finished `PositionAnalysis`, byte for byte what this route
+///   used to return as its JSON body.
+///
+/// A client that has never heard of `candidates` still works: it waits for
+/// `analysis` and gets exactly the old behaviour, one event later.
+///
+/// **Where the errors went.** Everything checkable before the search — unknown
+/// session, unknown node, no engine — is still an HTTP status with the usual
+/// `{"error": ...}` body, because it is decided before the response begins. But
+/// once the stream is open the status line has already been sent as `200`, so a
+/// failure *during* the search can only be an `error` event. The one that matters
+/// is `409 cancelled`: a newer `analyze` superseding this one now arrives as
+/// `event: error {"error":"cancelled"}`, possibly after several `candidates`
+/// events have already been drawn. Clients must treat the two shapes as the same
+/// condition — `web/src/api/client.ts` does, by turning the event back into the
+/// same `ApiError` the status used to produce.
+///
+/// The two-lane gate is untouched: this is still `Lane::Interactive`, so a
+/// running sweep is waited for rather than killed, and the cache is still
+/// consulted before the gate — a node the sweep already did answers with a single
+/// `analysis` event and no `candidates` at all, because there was no search to
+/// narrate.
 async fn analyze(
     State(state): State<AppState>,
     Path(id): Path<String>,
     JsonBody(req): JsonBody<AnalyzeRequest>,
-) -> Result<Json<PositionAnalysis>, ApiError> {
+) -> Result<Response, ApiError> {
     let session = state.sessions.get(&id).ok_or_else(session_not_found)?;
     if session.tree.get(req.node_id).is_none() {
         return Err(node_not_found());
     }
     let pipeline = state.pipeline().ok_or_else(engine_unavailable)?;
 
-    let analysis = pipeline
-        .analyze_node(&session.tree, req.node_id, req.depth)
-        .await
-        .map_err(ApiError::from)?;
+    let (tx, rx) = unbounded_channel();
+    let sessions = state.sessions.clone();
+    let tree = session.tree;
 
-    store_analysis(&state.sessions, &id, req.node_id, analysis.clone());
-    Ok(Json(analysis))
+    tokio::spawn(async move {
+        let outcome = {
+            let tx = tx.clone();
+            pipeline
+                .analyze_node_streaming(&tree, req.node_id, req.depth, move |update| {
+                    send(
+                        &tx,
+                        "candidates",
+                        json!({ "depth": update.depth, "candidates": update.candidates }),
+                    );
+                })
+                .await
+        };
+
+        match outcome {
+            Ok(analysis) => {
+                // The store sees the finished analysis and only the finished
+                // analysis; nothing above this line has touched it.
+                store_analysis(&sessions, &id, req.node_id, analysis.clone());
+                match serde_json::to_value(&analysis) {
+                    Ok(value) => send(&tx, "analysis", value),
+                    Err(e) => send(&tx, "error", json!({ "error": e.to_string() })),
+                }
+            }
+            // Reuse `ApiError`'s mapping so the message a client reads is the
+            // same string it used to read off the status body — "cancelled" for
+            // a superseded search, and so on.
+            Err(e) => send(&tx, "error", json!({ "error": ApiError::from(e).message })),
+        }
+    });
+
+    Ok(sse(rx))
 }
 
 // ─── analyze the whole game (SSE) ───────────────────────

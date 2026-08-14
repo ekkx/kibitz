@@ -281,7 +281,7 @@ Given a square where an exchange happens, statically settle it and return the ma
 
 ### 8.3 Move classification
 
-Thresholds follow Lichess's `lila/modules/analyse/src/main/Advice.scala`. Great / Miss do not exist in Lichess (they are Chess.com and WintrChess inventions), so we define them ourselves.
+`Blunder` and `Mistake` follow Lichess's `lila/modules/analyse/src/main/Advice.scala`. `Inaccuracy` and `Excellent` started there and have since been recalibrated against club-player games — see "Calibration" below. Great / Miss do not exist in Lichess (they are Chess.com and WintrChess inventions), so we define them ourselves.
 
 ```rust
 pub enum Classification {
@@ -306,12 +306,26 @@ Checks are evaluated top-down; the first match wins.
 | `Great` | See below |
 | `Blunder` | delta ≤ -0.30 (e.g. 80% → 50%) |
 | `Mistake` | delta ≤ -0.20 |
-| `Inaccuracy` | delta ≤ -0.10 |
+| `Inaccuracy` | delta ≤ -0.07 (Lichess: -0.10) |
 | `Best` | Matches the best move |
-| `Excellent` | delta > -0.02 |
-| `Good` | Everything else |
+| `Excellent` | delta > -0.03 (Lichess: -0.02) |
+| `Good` | Everything else, i.e. -0.07 < delta ≤ -0.03 |
 
 `Miss` is defined by the presence of mate rather than by win probability because a win-probability-based drop would double-fire with Blunder / Mistake.
+
+#### Calibration — why `Inaccuracy` and `Excellent` left Lichess
+
+Lichess's -0.10 and -0.02 leave `Good` a band 0.08 wide. Measured on 40 rated Lichess games between players in the 1200-1600 band (mean Elo 1440, 2639 classified moves, depth 12, no opening book), that band was the largest bucket in the table — **29.3% of every move played** — running from "indistinguishable from the best move" to "clearly an error" under a single label that reads as praise. Each edge moved for a different reason, and the distinction matters:
+
+**`Excellent` -0.02 → -0.03 is forced by measurement.** Re-running 16 of those games at depth 18 and diffing per move, the depth-12 delta agrees with the depth-18 delta to a median of 0.007, but the 90th percentile of the disagreement is 0.028 for moves in this region. A boundary at -0.02 sits *inside* the error bar of the number tested against it. -0.03 puts it just outside, and costs nothing: depth-12-vs-18 verdict agreement is identical at either value (776/1039 moves).
+
+**`Inaccuracy` -0.10 → -0.07 is a judgement call, recorded as one.** The delta distribution decays smoothly here with no knee, so no "correct" number exists in the data. What the data does establish is that the relabelled moves are real — of the 79 sampled moves losing 6-10 points of win probability at depth 12, the depth-18 median is -0.068, unmoved, and 71 still lose at least 4 points — and that they do not behave like good moves: 66% are outside the engine's top five candidates, the profile of an `Inaccuracy` (72%) rather than an `Excellent` (15%). The cost is about two points of depth agreement (74.7% → 72.6%), which is what drawing a finer line in a denser part of the distribution costs.
+
+Net effect on the sample: `Good` 29.3% → 17.1%, `Excellent` 22.6% → 29.5%, `Inaccuracy` 7.2% → 12.5%. `Mistake`, `Blunder` and `Miss` are untouched — this changes what stops counting as a *good* move, not what counts as a serious error.
+
+**Search depth was ruled out first.** The obvious competing explanation is that depth 12 (the default) invents these deltas out of fixed-depth noise. It does not: across the 1039 moves analysed at both depths the aggregate distribution barely moves (`Good` 27.8% → 25.8%, `Mistake` 2.5% → 2.6%), and 78.2% of depth-12 `Good` moves are still `Good` at depth 18. The bulk of the depth disagreement that does exist is `Best` ↔ `Excellent` churn (118 of 263 disagreements), which is MultiPV rank instability between two praise labels and is symmetric, so it biases nothing.
+
+**Most of that disagreement is not depth at all.** Two runs of the *same* 40 games at the *same* depth 12 with the *same* configuration agree on only 77.4% of verdicts, and reproduce just 3% of deltas exactly (median difference 0.0070, p90 0.0218) — essentially the same spread as depth 12 against depth 18. That is the multi-threaded search non-determinism documented on `DEFAULT_MULTIPV` in `crates/engine/src/lib.rs`. Two consequences: searching deeper buys far less verdict stability than it appears to, and no delta-based boundary can be drawn finer than about 0.02 no matter how much CPU is spent. Any future threshold work should be judged against the 77.4% run-to-run baseline rather than against 100%.
 
 #### Great (!) — "the only move"
 
@@ -321,14 +335,14 @@ Two routes reach `Great`. Either one is enough.
 
 ```
 1. played move is best (played_rank == 0)
-2. candidates[0].win_prob - candidates[1].win_prob ≥ 0.10
+2. candidates[0].win_prob - candidates[1].win_prob ≥ 0.30  (= -`BLUNDER_DELTA`)
 3. the position is undecided (0.10 < win_prob_before < 0.90)
-4. win probability holds anyway (delta ≥ -0.02)
+4. win probability holds anyway (delta ≥ `EXCELLENT_DELTA`, currently -0.03)
 ```
 
-"Any other move would have collapsed to at least an inaccuracy; only this one held the position." The gap between #1 and #2 is the core of the check, and MultiPV gives it to us for free.
+"Any other move would have collapsed the position; only this one held it." The gap between #1 and #2 is the core of the check, and MultiPV gives it to us for free. **Condition 2 is deliberately `-BLUNDER_DELTA`**: the runner-up's delta, had it been played, is exactly `-gap`, so the rule says the second-best move would itself have been a `Blunder`. See "Calibration — how often `Great` should fire" below for the measurements that set it, and for what it costs.
 
-**Condition 3 is the important one.** Without it, "the only move in a +15 position" fires on positions where nothing was ever at stake. Condition 4 matters for a subtler reason: position N and position N+1 are separate searches, so a move can rank first and still show a large negative delta — awarding "!" alongside an accuracy of 35 is a contradiction the user would be right to distrust.
+**Condition 3 is the important one.** Without it, "the only move in a +15 position" fires on positions where nothing was ever at stake. Only its upper bound is live — the gap is at most `win_prob_before`, so `DECIDED_LOW` cannot fire while `GREAT_GAP` exceeds it. Condition 4 matters for a subtler reason: position N and position N+1 are separate searches, so a move can rank first and still show a large negative delta — awarding "!" alongside an accuracy of 35 is a contradiction the user would be right to distrust.
 
 **Route B — the only move that mates.**
 
@@ -336,7 +350,7 @@ Two routes reach `Great`. Either one is enough.
 1. played move is best (played_rank == 0)
 2. candidates[0] is Mate(n) for the side to move, n ≥ 2
 3. candidates[1] exists and is not mate for the side to move
-4. win probability holds anyway (delta ≥ -0.02)
+4. win probability holds anyway (delta ≥ `EXCELLENT_DELTA`, currently -0.03)
 ```
 
 The mirror image of `Miss`, and defined the same way — by the presence of mate, never by a win-probability gap. **This is why route B does not use the 0.10 gap of route A**: mate saturates to 1.0 (§8.1), so against a second-best of +9.00 the gap is about 0.035 and route A's condition 2 fails, even though finding a forced mate in two where every other move merely wins is exactly the case worth marking. It is the §8.1 problem pointed at the winning side, so probability arithmetic is not used here at all.
@@ -347,7 +361,34 @@ There is no `undecided` condition on route B, and route A keeps its own: a force
 
 In `testdata/opera_game.pgn` at depth 12, route B moves exactly one verdict: `16.Qb8+` from `Best` to `Great`. White's win probability there is already 1.0 and the runners-up are +3.43 and +3.34, so route A cannot reach it. `17.Rd8#` scores `Mate(1)` and stays `Best`.
 
-**The Great thresholds will need tuning.** This is where false positives are most likely, so start conservative and loosen while running my own games through it. Keep the thresholds together as constants in `classify.rs`.
+#### Calibration — how often `Great` should fire
+
+This document predicted the Great thresholds would need tuning. They did.
+
+The corpus is a fresh draw by the recipe above, since the earlier games were not kept: **the Lichess open database for 2015-01, rated classical, both players 1200–1600, at least 40 plies, first 40 games in file order** — mean Elo 1458, 3,286 classified moves, depth 12, MultiPV 5, no opening book. Rates therefore differ in the second decimal from the delta calibration's, and the harness is again a throwaway (`cargo run --example`) rather than shipped code: it analyses a directory of PGNs and dumps one JSON record per move — the two top candidates, the played move's rank, the delta and the verdict — so thresholds can be re-swept offline without touching the engine.
+
+On that corpus `GREAT_GAP = 0.10` marked **6.27% of all moves — 5.15 a game, a median of 4, and only 2 of 40 games without one.** "The only move that held the position" cannot happen four times a game.
+
+The two routes were measured separately. Route A produced 193 of the 206 marks (5.87% of all moves); **route B produced 13 — 0.40%, about one game in three — and is left exactly as it was.** It is already rare, every one of its marks is a move route A cannot reach, and it is what puts the "!" on the queen sacrifice.
+
+Route A's gap distribution has its mode against the old threshold: 28.5% of qualifying moves sat in the single bucket 0.10–0.15 (p25 = 0.138, median 0.248), so the line was drawn through the densest part of the distribution. The rate falls smoothly with no knee — 5.87% at 0.10, 3.62% at 0.20, 2.13% at 0.30, 1.10% at 0.40 — so the data does not choose a number. **0.30 is chosen because it is `-BLUNDER_DELTA`**, which makes the rule say something the table already says: the runner-up would itself have been a blunder. The old 0.10 asked for less collapse than an `Inaccuracy`.
+
+| | old (0.10) | new (0.30) | for scale |
+|---|---|---|---|
+| % of all moves | 6.27% | **2.53%** | `Blunder` 3.41%, `Mistake` 1.98% |
+| per game | 5.15 | **2.08** | |
+| median per game | 4 | **1** | |
+| games with none | 2 of 40 | **7 of 40** | |
+
+The mean sits above the median because of one 137-ply game — a pawn race and a queen-versus-pawn ending, where "the only move that holds" is literally true 15 times.
+
+**`undecided` was measured too, and stays at 0.10 / 0.90.** Its lower bound never fires and cannot: the gap is at most `win_prob_before`. Its upper bound does real work — it blocks 22 of the 92 moves that otherwise clear the new gap. Tighter bands were tried and rejected: (0.20, 0.80) gives 2.25% and (0.30, 0.70) gives 1.86%, but a 0.30 collapse from 0.80 leaves the mover at 0.50, which is a won game thrown away, not a case of nothing being at stake.
+
+**What the gap cannot do.** 69% of the moves qualifying at 0.30 are captures, against 36.5% of all rank-0 moves — and that proportion is the same at 0.10 and at 0.40. Most of what the rule finds is forced recaptures: "the only move" in the arithmetic sense, and never hard to see. Nothing in win probability separates them from a move that had to be found (`see.rs` could, but classification stopped reading SEE when `Brilliant` was removed). The threshold sets how often the mark appears, not how deserved it is.
+
+**Stability is not the argument either way.** Two identical depth-12 runs of the corpus agree on 79.9% of verdicts. Of the moves marked `Great` in run 1, 94.7% are `Great` in run 2 at the old gap and 90.4% at the new one — better than verdicts in general at either setting. Raising the line does not buy reproducibility; the moves sitting on it stay roughly constant in number (11 vs 8) while the population shrinks by two thirds.
+
+**The cost: `testdata/opera_game.pgn` drops from 6 `Great`s to 1** in the run this was measured on, and from 4 to 2 in a second depth-12 run of the same game — the difference is `11.Bxb5+`, whose gap comes out 0.296 once and 0.337 the next time, i.e. exactly on the line. `16.Qb8+` survives either way, by route B. `10.Nxb5` — the knight sacrifice this document has cited as a landmark verdict — does not: its gap is 0.137–0.149, because win probability saturates (§8.1), so from 0.76 the alternatives still lead to 0.62 and in this tool's currency missing it costs 14 points, an inaccuracy rather than a collapse. That is a real loss, accepted rather than worked around: what made those moves special is that they were sacrifices, and the `Brilliant` note below already settled that a sacrifice belongs in the explanation text rather than in the glyph. A gap low enough to keep them is a gap that also keeps 4.83 marks a game.
 
 #### Note: `Brilliant` (!!) was removed
 
@@ -430,13 +471,14 @@ Two different questions live in this chapter, and keeping them apart matters:
 
 | Question | Answered by | Depends on the network |
 |---|---|---|
-| **Is this move still theory?** | Lichess Opening Explorer game counts | yes |
+| **Is this move still theory?** | Lichess Opening Explorer game counts, or the ECO table when the Explorer is unreachable (§9.3) | preferably |
 | **What is this opening called?** | An ECO table embedded in the binary | no |
 
-Only the first can produce `Classification::Book`. Naming a position is not evidence
-that the move played is theory — a named line ending is not the same event as leaving
-the book — so the ECO table is display-only and is deliberately barred from touching
-classification (there is a test asserting `eco.rs` never references `Classification`).
+Naming a position is still not the same event as leaving the book, and the two indexes
+are built for the two different questions — names from the position each ECO row *ends*
+on, theory from every position a row *passes through*. `eco.rs` hands out both as facts
+and never a verdict; `Book::judge` decides what they are worth (there is a test
+asserting `eco.rs` never references `Classification` or `BookVerdict`).
 
 ### 9.1 Is it theory? — Lichess Opening Explorer
 
@@ -489,15 +531,71 @@ in a line carries a name.
 This became load-bearing rather than decorative: **the Explorer has returned `401` for
 every request since an outage beginning 2026-02-23**
 ([lichess-org/lila#19610](https://github.com/lichess-org/lila/issues/19610), still
-open, and affecting other clients too). While that lasts, 9.1 yields nothing and the
-ECO table is the only opening information available. The book layer treats an auth
-failure as "unavailable", stops asking for an hour, and analysis proceeds without it.
+open, and affecting other clients too). While that lasts, 9.1 yields nothing. The book
+layer treats an auth failure as "unavailable" and stops asking for an hour — and then
+falls back to the table below.
+
+### 9.3 The ECO fallback — reversing "names only"
+
+**This section reverses a decision recorded above, on purpose.** The original rule was
+that ECO supplies names and never a verdict, because "this position has a name" is a
+far weaker claim than "N thousand games reached it": a named line can still be a bad
+move order, and the table carries no frequency information at all. *That reasoning is
+still correct.* What changed is availability. Six months into the outage,
+`Classification::Book` has never been produced in practice, and theoretical opening
+moves are being handed to the engine and returned as `Inaccuracy`. A weak mark that
+appears is more useful than a strong one that never does, so the weaker claim is now
+allowed to speak — **only where the stronger one cannot**.
+
+The Explorer stays authoritative. Whenever a response exists, live or from the SQLite
+cache, its game counts decide and the ECO table is not consulted; the two are never
+merged. The fallback runs only on the "Explorer off limits" path (401/403/429 cooldown).
+A genuine fault — a 500, a malformed body — still surfaces as an error and still
+degrades to `OutOfBook`, which is the property `pipeline.rs` depends on.
+
+**"In book" in ECO terms.** Three conditions, all required:
+
+1. The position *after* the move occurs somewhere in the vendored lines. This uses a
+   second index — every position each row passes through, 7,855 of them, against 3,810
+   named line ends. Indexing whole lines rather than their endpoints is what makes the
+   mark continuous: "the position after the move is *named*" would stop the book at ply
+   6 of `testdata/ruy_lopez_chigorin.pgn` and resume at 22, when the theory in fact runs
+   unbroken to ply 25.
+2. The position *before* the move is in that index too. One position matching is a
+   coincidence; two consecutive ones joined by the move actually played is a line. This
+   is the guard against the mark reappearing on a transposition thirty moves later, and
+   it is needed because `judge` is called per move on the interactive path, where there
+   is no "we already left the book" state. `judge_line` enforces the same thing across a
+   sweep by never re-entering.
+3. The move is within `eco_max_ply` = **30 plies** (move 15). A backstop for what
+   continuity cannot catch — a game that wanders back into a theory position long after
+   leaving its own opening. Set from both ends: 99.9% of vendored rows end by ply 28 and
+   the deepest ends at 36, while over 3,286 plies of club games the longest continuous
+   run through the index was 10 plies and the Chigorin test game runs 25. Nothing
+   measured is cut; past move 15 the claim "you were still following preparation" has
+   stopped being plausible anyway.
+
+Anything else is `LeftBook` when the position before the move was theory and `OutOfBook`
+when it was not — the same split the Explorer path makes between "known position,
+unknown continuation" and "unknown position".
+
+**What is knowingly given up.** `min_games` has no counterpart offline, so any sideline
+one vendored row happens to contain counts as book: after 1. e4 e5 2. Nf3 Nc6 3. Bb5,
+the table calls 3... a5 theory (it is the Bulgarian Variation) and 3... Nh6 not. The
+Explorer would have weighed those by how often they were actually played. This is the
+weakness the original decision was protecting against, accepted deliberately in exchange
+for a mark that exists.
+
+Measured on club games, the fallback marks the first **2 to 10 plies** of a game as book
+(median 4). `testdata/opera_game.pgn` gets **7**: through 4. dxe5, leaving the book on
+4... Bxf3. The last *named* position there is 3. d4 at ply 5, which is the gap condition
+1 exists to close.
 
 ## 10. engine — Stockfish
 
 - Drive **native Stockfish** (`brew install stockfish`) over UCI. 2-3x faster than WASM, and NNUE runs at full strength
 - Hold stdin/stdout via `tokio::process` and parse `info ... multipv N ... pv ...`
-- **`MultiPV = 5`**, one fixed width for every search, never a request parameter. Classification reads only ranks 0 and 1 (the best move, and the second for the Great check); ranks 3 to 5 exist so the board can draw up to five arrows. Two reasons the width is fixed rather than client-chosen: `multipv` is part of the analysis cache key, so a negotiable width would silently re-analyse an already-analysed game whenever the setting changed; and the width is **not classification-neutral** — re-running `testdata/opera_game.pgn` at depth 12 moved 9 of 33 verdicts between width 3 and 5, because MultiPV shifts how effort is spent and the "only move" gap compares exactly the two top scores. A client-chosen width would mean two users disagreeing about the same game. The landmark verdicts are stable either way (`Nxb5!!`, `Bxb5+!`, `Nxd7??`)
+- **`MultiPV = 5`**, one fixed width for every search, never a request parameter. Classification reads only ranks 0 and 1 (the best move, and the second for the Great check); ranks 3 to 5 exist so the board can draw up to five arrows. Two reasons the width is fixed rather than client-chosen: `multipv` is part of the analysis cache key, so a negotiable width would silently re-analyse an already-analysed game whenever the setting changed; and the width is **not classification-neutral** — re-running `testdata/opera_game.pgn` at depth 12 moved 9 of 33 verdicts between width 3 and 5, because MultiPV shifts how effort is spent and the "only move" gap compares exactly the two top scores. A client-chosen width would mean two users disagreeing about the same game. (That measurement predates the Great calibration in §8.3, which removed five of that game's six `Great`s outright. `Nxd7??` is unaffected, and the one surviving mark, `16.Qb8+!`, comes from route B, which does not read the gap the width perturbs)
 
   The cost is badly non-linear in the width, not linear as this line previously claimed. Over the 34 positions of that game at depth 12: raw Stockfish MultiPV 1 → 0.85s, 3 → 5.44s, 5 → 8.10s; the whole sweep fresh-cache → 6.9s at width 3, 10.0s at width 5. Almost all of the cost is the step away from a single PV (6.4x), which gives up aspiration windows and root pruning; widening 3 → 5 shares that work and adds only ~45%. That asymmetry is what makes a fixed width of 5 affordable — re-measure before changing it again
 - `Threads = CPU count - 1`, `Hash = 1024`

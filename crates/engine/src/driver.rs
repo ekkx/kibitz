@@ -18,6 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::progress::{CompletedDepth, DepthTracker};
 use crate::uci::{self, InfoLine};
 use crate::{EngineConfig, EngineError};
 
@@ -51,6 +52,13 @@ pub(crate) struct SearchSpec {
     pub multipv: usize,
     /// Space-separated UCI moves for `go ... searchmoves`.
     pub searchmoves: Option<String>,
+    /// Where finished iterations are reported while the search is still running.
+    ///
+    /// `None` for every caller that only wants the answer, which is all of them
+    /// except [`crate::Engine::analyze_streaming`]. Raw [`InfoLine`]s rather than
+    /// candidates: turning a PV into SAN needs a board, and the board is the
+    /// caller's, not this task's.
+    pub progress: Option<mpsc::UnboundedSender<CompletedDepth>>,
 }
 
 /// Raw engine output for one search. Turning PVs into SAN needs a board, which
@@ -331,6 +339,12 @@ impl Driver {
         // Best info line seen per MultiPV rank. BTreeMap so ranks come out in
         // order, with rank 1 first.
         let mut best: BTreeMap<usize, InfoLine> = BTreeMap::new();
+        // The same lines again, grouped by iteration, for a caller that wants to
+        // watch the search rather than only its answer. Kept separate from `best`
+        // on purpose: `best` accumulates the deepest line per rank across the
+        // whole search, which is the *result*, while this is a running commentary
+        // that has to forget each depth as the next one opens.
+        let mut tracker = DepthTracker::new();
         let mut superseded = false;
         // Deadline for the `bestmove` that must follow a `stop`.
         let mut stop_deadline: Option<tokio::time::Instant> = None;
@@ -351,6 +365,13 @@ impl Driver {
                     if let Some(info) = uci::parse_info(&line) {
                         if info.multipv > spec.multipv {
                             continue;
+                        }
+                        if let Some(progress) = &spec.progress
+                            && let Some(closed) = tracker.push(info.clone())
+                        {
+                            // A closed receiver means the caller gave up on the
+                            // commentary; the search itself carries on.
+                            let _ = progress.send(closed);
                         }
                         match best.get(&info.multipv) {
                             Some(current) if current.depth > info.depth => {}
@@ -380,7 +401,20 @@ impl Driver {
         }
 
         if superseded {
+            // No flush. A stopped search was cut off part-way through an
+            // iteration, so what is buffered is a set that was never true of any
+            // depth — see `progress::DepthTracker::flush`.
             return Err(EngineError::Cancelled);
+        }
+
+        // The last iteration is finished, so report it now rather than leaving
+        // the caller to infer it from the result. For an interactive analysis
+        // that is the difference between the arrows reaching full depth when the
+        // engine gets there and reaching it when everything else is also done.
+        if let Some(progress) = &spec.progress
+            && let Some(closed) = tracker.flush()
+        {
+            let _ = progress.send(closed);
         }
 
         let depth = best.values().map(|info| info.depth).max().unwrap_or(0);

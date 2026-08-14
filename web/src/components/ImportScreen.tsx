@@ -1,14 +1,7 @@
 import { useState } from 'react';
 import { GitBranch, MessageSquareText, ScanSearch } from 'lucide-react';
 import { Button } from './ui/button.tsx';
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardFooter,
-  CardHeader,
-  CardTitle,
-} from './ui/card.tsx';
+import { Card, CardContent, CardFooter, CardHeader, CardTitle } from './ui/card.tsx';
 import { Input } from './ui/input.tsx';
 import { Label } from './ui/label.tsx';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './ui/tabs.tsx';
@@ -95,9 +88,11 @@ export function ImportScreen({ busy, error, onOpen }: ImportScreenProps): React.
         </div>
 
         <Card>
+          {/* No description under the title: the tabs directly below it say
+              "PGN" and "Position", which is the whole of what the sentence
+              there used to say. */}
           <CardHeader>
             <CardTitle className="text-xl tracking-tight">{t('import.title')}</CardTitle>
-            <CardDescription>{t('import.subtitle')}</CardDescription>
           </CardHeader>
 
           <CardContent>

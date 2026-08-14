@@ -55,8 +55,9 @@ about what you are about to do.
    or two sentences.
 2. **How the opponent punishes it.** Walk `counterfactual.pv` and name the motifs listed in
    `counterfactual.motifs`. When `counterfactual.kind` is `alternative_collapse` the move
-   was a good one, so this becomes what would have collapsed after the second-best move
-   instead.
+   was a good one, so this becomes what would have collapsed after the alternative move
+   instead — the best move when the player did not play it, the second-best when they did.
+   Read that move off the front of `counterfactual.pv`; do not assume which one it is.
 3. **The positional reasons.** The entries in `static_diff.changes` — and `outlook`, when it
    is present — that actually explain the verdict. Two or three at most; drop the rest.
 
@@ -108,7 +109,9 @@ const JA_ROLE: &str = r#"あなたはチェス解析ツール kibitz の解説�
 1. **結論。** `played.classification` の判定に沿って、その手が何だったのかを 1〜2 文で。
 2. **相手にどう咎められるか。** `counterfactual.pv` を順に追い、`counterfactual.motifs` の
    戦術モチーフを名前で挙げてください。`counterfactual.kind` が `alternative_collapse` の
-   場合、その手は好手なので、代わりに次善手を選んでいたら何が崩れていたかを書きます。
+   場合、その手は好手なので、代わりに別の手を選んでいたら何が崩れていたかを書きます。その
+   「別の手」は、指した手が最善手だったときは次善手、そうでないときは最善手です。どちらか
+   は決めつけず、`counterfactual.pv` の先頭から読み取ってください。
 3. **位置的な理由。** `static_diff.changes` と（あれば）`outlook` のうち、その判定を実際に
    説明している項目だけを挙げます。多くても 2〜3 点にとどめ、残りは捨ててください。
 
@@ -179,7 +182,7 @@ JSON 内の英語のキーや値は、本文では次の日本語を使ってく
 - `pv` / `long_pv` — 読み筋
 - `counterfactual` — もし別の手を指していたらどうなっていたか
 - `refutation` — 咎め方
-- `alternative_collapse` — 次善手を選んでいた場合の崩壊
+- `alternative_collapse` — 別の手を選んでいた場合の崩壊
 - `win_prob` / `win_prob_before` / `win_prob_after` — 勝率
 - `delta` — 勝率の増減
 - `accuracy` — 正確度

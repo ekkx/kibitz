@@ -26,21 +26,10 @@ export const classificationColor = (classification: Classification): string =>
 export const classificationLabel = (classification: Classification): string =>
   t(`class.${classification}` as const);
 
-/** Classifications worth drawing attention to in the move list. */
-export function isNotable(classification: Classification): boolean {
-  return (
-    classification === 'great' ||
-    classification === 'inaccuracy' ||
-    classification === 'mistake' ||
-    classification === 'blunder' ||
-    classification === 'miss'
-  );
-}
-
 /**
- * Classifications that lost something, as opposed to the merely notable ones:
- * `great` is worth pointing at too, but nothing was thrown away, so nothing
- * should be drawn on the board in red.
+ * Classifications that lost something — what the board draws in red and what
+ * the move list's jump controls stop on. `great` is worth pointing at too, but
+ * nothing was thrown away, so nothing is drawn on the board in red.
  */
 export function isMistake(classification: Classification): boolean {
   return (

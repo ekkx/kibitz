@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { Play, Square } from 'lucide-react';
 import type { Candidate, Motif, PositionAnalysis } from '../api/types.ts';
 import type { AnalysisStatus } from '../state/useSession.ts';
@@ -20,6 +20,7 @@ import {
   percent,
   signedPercent,
 } from '../ui/format.ts';
+import { findSanMentionsIn, type SanFrame, type SanMention } from '../ui/sanMentions.ts';
 import { t } from '../i18n/index.ts';
 
 export interface AnalysisPanelProps {
@@ -32,9 +33,13 @@ export interface AnalysisPanelProps {
   nodeId: number | null;
   /** Explanation language, forwarded to `/ask`. */
   lang: string;
+  /** The positions the written text quotes moves from (`ui/sanMentions.ts`). */
+  frames: readonly SanFrame[];
   onPlaySan: (san: string) => void;
   /** Draw this candidate's line on the board; `null` clears the preview. */
   onPreview: (candidate: Candidate | null) => void;
+  /** Draw a move named in the text; `null` clears it. */
+  onHoverSan: (mention: SanMention | null) => void;
   onAnalyze: () => void;
 }
 
@@ -58,8 +63,10 @@ export function AnalysisPanel({
   sessionId,
   nodeId,
   lang,
+  frames,
   onPlaySan,
   onPreview,
+  onHoverSan,
   onAnalyze,
 }: AnalysisPanelProps): React.JSX.Element {
   const played = analysis?.context?.played ?? null;
@@ -70,8 +77,28 @@ export function AnalysisPanel({
     <Card size="sm" className="flex min-h-0 flex-col gap-0 py-0">
       <CardHeader className="border-b py-3">
         <CardTitle className="text-sm">{t('analysis.title')}</CardTitle>
+        {/*
+          The depth of what is on screen, and — while a search is running — the
+          only thing that says so.
+
+          `analysis.depth` is read off whichever object the panel is describing,
+          which during a search is the partial result (`state/useSession.ts`), so
+          the number here is always the depth of the numbers beside it. It counts
+          up as the engine reports iterations.
+
+          The pulse is the searching indicator, and it is the whole of it. A
+          spinner or a second "analysing…" line would be a separate claim about
+          the same fact, competing with the one piece of information that is
+          actually changing; making the changing number itself look unsettled
+          says "this is still moving" without adding anything to read.
+        */}
         {analysis && (
-          <CardAction className="self-center font-mono text-xs text-muted-foreground">
+          <CardAction
+            className={cn(
+              'self-center font-mono text-xs text-muted-foreground',
+              status === 'loading' && 'animate-pulse',
+            )}
+          >
             {t('eval.depth', { n: analysis.depth })}
           </CardAction>
         )}
@@ -89,15 +116,41 @@ export function AnalysisPanel({
             <p className="text-sm text-muted-foreground">{t('analysis.analyzing')}</p>
           )}
 
+          {/* The button is the whole empty state. It used to be introduced by a
+              sentence explaining that selecting or playing a move analyses the
+              position — which is what the button underneath it said, in more
+              words and one step further away from being pressed. */}
           {!analysis && status !== 'loading' && (
-            <div className="flex flex-col items-start gap-3">
-              <p className="text-sm text-muted-foreground">{t('analysis.idle')}</p>
-              <Button variant="outline" size="sm" onClick={onAnalyze}>
-                {t('analysis.analyzeNow')}
-              </Button>
-            </div>
+            <Button variant="outline" size="sm" onClick={onAnalyze}>
+              {t('analysis.analyzeNow')}
+            </Button>
           )}
 
+          {/*
+            The verdict, and what stands here while it does not exist yet:
+            nothing.
+
+            `/analyze` streams the engine's ranking as it deepens but sends the
+            classification, the accuracy and the counterfactual once, at the
+            final depth (API.md). So for the couple of hundred milliseconds a
+            search takes, this block and the counterfactual below it are simply
+            absent, and the panel is a candidate list under a climbing depth.
+
+            Not a skeleton, for two reasons. The shape is unknown — this region
+            is a badge plus three figures plus, sometimes, a counterfactual with
+            a variable number of motif chips — so a placeholder would be a guess
+            that resolves to a different height, which is the jump a skeleton
+            exists to prevent. And there is already an honest progress signal a
+            few pixels away: the depth in the header, pulsing while it climbs.
+            A skeleton would be a second, louder claim that something is coming,
+            in the one part of the panel that must not appear to be saying
+            anything yet.
+
+            What matters more than either is what is *not* here: the previous
+            node's verdict. `analysis` is keyed on the selected node
+            (`state/useSession.ts`), so a node with no finished analysis has no
+            `context` and no `played` — never the last one's.
+          */}
           {played && (
             <div className="flex w-full flex-col gap-2">
               <div className="flex flex-wrap items-center gap-2.5">
@@ -197,10 +250,17 @@ export function AnalysisPanel({
                 {explanation.status === 'done' && explanation.cached && ` · ${t('explain.cached')}`}
                 {explanation.model && ` · ${explanation.model}`}
               </SectionLabel>
-              <p className="text-sm leading-relaxed whitespace-pre-wrap">
-                {explanation.text}
+              <MoveProse
+                text={explanation.text}
+                frames={frames}
+                streaming={explanation.status === 'streaming'}
+                onHover={onHoverSan}
+              >
                 {explanation.status === 'streaming' && <Cursor />}
-              </p>
+              </MoveProse>
+              {explanation.status === 'not-analyzed' && (
+                <p className="text-sm text-muted-foreground">{t('explain.notAnalyzed')}</p>
+              )}
               {explanation.status === 'error' && (
                 <p className="text-sm text-destructive">
                   {t('explain.failed', { message: explanation.error ?? '' })}
@@ -243,7 +303,13 @@ export function AnalysisPanel({
           )}
 
           {sessionId && nodeId !== null && (
-            <AskBox sessionId={sessionId} nodeId={nodeId} lang={lang} />
+            <AskBox
+              sessionId={sessionId}
+              nodeId={nodeId}
+              lang={lang}
+              frames={frames}
+              onHoverSan={onHoverSan}
+            />
           )}
         </div>
       </ScrollArea>
@@ -264,6 +330,87 @@ function SectionLabel({ children }: { children: React.ReactNode }): React.JSX.El
 /** A number inside a sentence: figures line up, prose does not shift. */
 function Figure({ children }: { children: React.ReactNode }): React.JSX.Element {
   return <b className="font-mono font-semibold text-foreground tabular-nums">{children}</b>;
+}
+
+/**
+ * Written text with the notation in it made hoverable, so that pointing at
+ * `Qxg3` draws it on the board.
+ *
+ * Which spans count is decided by `ui/sanMentions.ts` — including, and this is
+ * the part worth reading before changing anything here, whether each one is a
+ * *legal* move in a position the text could be quoting from, and so whether it
+ * is drawn as that move or as the square it names. Everything else stays
+ * exactly the text it was.
+ *
+ * Both kinds are the same affordance here: this component knows only that a
+ * span is worth pointing at, and the board decides what the answer looks like.
+ *
+ * The affordance is a dotted underline, and it is gated on a fine pointer,
+ * because on a touch screen it would advertise something that cannot be done.
+ * Nothing is lost there: no move is only reachable through this, the board and
+ * the candidate list are unchanged, and the text still reads as text.
+ *
+ * Hover, not click. This is a lookup — "where is that" — and the answer is an
+ * arrow that disappears when the pointer leaves. Playing the move, or
+ * navigating to it, is what the move list and the candidate rows are for, and
+ * a paragraph of prose is the wrong place to put a dozen tab stops and a dozen
+ * ways to lose your position in the game.
+ *
+ * Rendering is a flat list of strings and spans inside one paragraph, so the
+ * text stays one continuous run for selection and copying, and
+ * `whitespace-pre-wrap` still governs the whole of it.
+ */
+function MoveProse({
+  text,
+  frames,
+  streaming,
+  onHover,
+  children,
+}: {
+  text: string;
+  frames: readonly SanFrame[];
+  streaming: boolean;
+  onHover: (mention: SanMention | null) => void;
+  children?: React.ReactNode;
+}): React.JSX.Element {
+  const mentions = useMemo(
+    () => findSanMentionsIn(text, frames, { streaming }),
+    [text, frames, streaming],
+  );
+
+  const parts: React.ReactNode[] = [];
+  let cursor = 0;
+  for (const mention of mentions) {
+    if (mention.start > cursor) parts.push(text.slice(cursor, mention.start));
+    parts.push(
+      <span
+        key={mention.start}
+        className="rounded-[3px] transition-colors hover:bg-primary/15 pointer-fine:cursor-help pointer-fine:underline pointer-fine:decoration-muted-foreground pointer-fine:decoration-dotted pointer-fine:underline-offset-[3px]"
+        onMouseEnter={() => onHover(mention)}
+        onMouseLeave={() => onHover(null)}
+      >
+        {mention.text}
+      </span>,
+    );
+    cursor = mention.end;
+  }
+  parts.push(text.slice(cursor));
+
+  return (
+    /*
+      The paragraph clears the hover as well as each span, because a span can
+      stop existing under a stationary pointer: the text re-flows as it streams,
+      and a token that moves out from under the cursor never fires its own
+      `mouseleave`.
+    */
+    <p
+      className="text-sm leading-relaxed whitespace-pre-wrap"
+      onMouseLeave={() => onHover(null)}
+    >
+      {parts}
+      {children}
+    </p>
+  );
 }
 
 /** The block that follows streaming text, so a pause reads as "still writing". */
@@ -349,15 +496,23 @@ function MotifChip({ motif }: { motif: Motif }): React.JSX.Element {
   );
 }
 
-/** Follow-up questions (`POST /ask`, API.md Phase 3) — the same stream shape. */
+/**
+ * Follow-up questions (`POST /ask`, API.md Phase 3) — the same stream shape,
+ * about the same position, so the answer's moves are hoverable on the same
+ * terms as the explanation's.
+ */
 function AskBox({
   sessionId,
   nodeId,
   lang,
+  frames,
+  onHoverSan,
 }: {
   sessionId: string;
   nodeId: number;
   lang: string;
+  frames: readonly SanFrame[];
+  onHoverSan: (mention: SanMention | null) => void;
 }): React.JSX.Element {
   const [question, setQuestion] = useState('');
   const [answer, setAnswer] = useState('');
@@ -414,10 +569,9 @@ function AskBox({
         </Button>
       </form>
       {answer && (
-        <p className="text-sm leading-relaxed whitespace-pre-wrap">
-          {answer}
+        <MoveProse text={answer} frames={frames} streaming={busy} onHover={onHoverSan}>
           {busy && <Cursor />}
-        </p>
+        </MoveProse>
       )}
     </div>
   );

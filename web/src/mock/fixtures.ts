@@ -5,9 +5,10 @@ import { SAMPLE_PGN } from '../ui/samplePgn.ts';
  * Fixture data for `VITE_MOCK=1`.
  *
  * The game is Morphy's Opera Game — short, famous, and it contains everything
- * the UI has to render: a quiet inaccuracy, an outright blunder, two piece
- * sacrifices that were each the only move that held, and a forced mate at the
- * end so the `{kind:"mate"}` branch of `Score` gets exercised.
+ * the UI has to render: an opening still in book, a quiet inaccuracy, an
+ * outright blunder, two piece sacrifices, and a forced mate at the end so the
+ * `{kind:"mate"}` branch of `Score` gets exercised. Only the second sacrifice —
+ * the queen, which forces mate — carries a `!`; see the note on ply 19.
  *
  * Only the interesting moves are scripted; every other position is synthesised
  * by `mock/engine.ts` from the actual legal moves, so all SAN in the mock is
@@ -111,9 +112,15 @@ export const SCRIPTED_MOVES: ScriptedMove[] = [
     },
   },
   {
-    // 10. Nxb5 — a knight for a pawn, and correct.
+    // 10. Nxb5 — a knight for a pawn, and correct. `best`, not `great`: the
+    // runner-up here is 0.29 of win probability behind, and since the Great
+    // calibration (DESIGN §8.3) the mark takes a blunder-sized 0.30. The real
+    // server agrees — at depth 12 this move's gap is 0.149 and it comes out
+    // `Best`. The sacrifice is still the point of the position; it is described
+    // in the explanation rather than announced by the glyph, which is where the
+    // `Brilliant` note says it belongs.
     ply: 19,
-    classification: 'great',
+    classification: 'best',
     win_prob_before: 0.94,
     win_prob_after: 0.95,
     accuracy: 100,
@@ -183,7 +190,8 @@ export const SCRIPTED_MATES: Record<number, Score> = {
  * case most likely to be rendered wrong, so mock mode always exercises it.
  *
  * Note that neither the table nor its end says anything about theory. It stops
- * naming positions; the players have not "left book".
+ * naming positions; the players have not "left book" — that is [`BOOK_LINE`],
+ * which runs two plies further.
  */
 const OPENING_TABLE: Record<string, { eco: string; name: string }> = {
   e4: { eco: 'B00', name: 'King’s Pawn Game' },
@@ -213,6 +221,31 @@ export function openingForPath(sanPath: readonly string[]): OpeningInfo | null {
   const entry = OPENING_TABLE[sanPath.join(' ')];
   if (!entry) return null;
   return { eco: entry.eco, name: entry.name, matched_plies: sanPath.length };
+}
+
+/**
+ * How far the sample game is still theory — the moves the server classifies as
+ * `Book` and never sends to the engine.
+ *
+ * Transcribed from the real thing rather than recomputed: the server asks the
+ * Lichess Opening Explorer and, while that is down (401 since 2026-02-23), falls
+ * back to the position index of its embedded ECO table, which is 388 KB of TSV
+ * this bundle has no business shipping. These seven plies are what
+ * `kibitz analyze testdata/opera_game.pgn` marks today.
+ *
+ * It deliberately reaches two plies past the last *named* position in
+ * `OPENING_TABLE` above: naming and theory are separate questions, and the UI
+ * has to render a move that is book without a name of its own.
+ */
+const BOOK_LINE = ['e4', 'e5', 'Nf3', 'd6', 'd4', 'Bg4', 'dxe5'] as const;
+
+/** Whether the move reached by `sanPath` is still book. See [`BOOK_LINE`]. */
+export function isBookPath(sanPath: readonly string[]): boolean {
+  return (
+    sanPath.length > 0 &&
+    sanPath.length <= BOOK_LINE.length &&
+    sanPath.every((san, index) => san === BOOK_LINE[index])
+  );
 }
 
 export const MOCK_LANGUAGES = {
