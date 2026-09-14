@@ -300,6 +300,17 @@ fn undecided(win_prob_before: f64) -> bool {
 /// If the best move was also getting mated there is nothing to blame the move
 /// for, so the delta decides as usual.
 fn walks_into_mate(input: &ClassifyInput) -> bool {
+    // Never the engine's own first choice. Position N and position N+1 are
+    // separate searches — the same disagreement `Great` guards against above,
+    // pointed at the losing side. At depth 12 a move can lead the candidate
+    // list on one search and show a forced mate on the next: seen in a real
+    // game at 40...Rg4, ranked #1 and scored -8.00 as a candidate, with mate in
+    // 11 on the board after it. Nothing was better to play, so there is nothing
+    // to blame the move for, and marking the engine's own pick `??` is a
+    // verdict the user would be right to distrust. The delta decides instead.
+    if input.played_rank == Some(0) {
+        return false;
+    }
     input.played.mating_side() == Some(false) && input.best.mating_side() != Some(false)
 }
 
@@ -517,6 +528,20 @@ mod tests {
         let out = classify(&i);
         assert!(out.delta > BLUNDER_DELTA, "delta={} ", out.delta);
         assert_eq!(out.classification, Classification::Blunder);
+    }
+
+    #[test]
+    fn the_engines_own_first_choice_is_never_blamed_for_the_mate() {
+        // Ranked first and mated anyway: the two searches disagree, and the
+        // player had nothing better on offer. Same input, ranked fourth, is the
+        // case the rule exists for.
+        let mut i = input(at(0.15), Score::Mate(-2));
+
+        i.played_rank = Some(0);
+        assert_ne!(class(&i), Classification::Blunder);
+
+        i.played_rank = Some(3);
+        assert_eq!(class(&i), Classification::Blunder);
     }
 
     #[test]
