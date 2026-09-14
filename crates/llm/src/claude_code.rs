@@ -46,6 +46,7 @@ impl Provider for ClaudeCodeProvider {
     ) -> Result<TextStream, LlmError> {
         self.run(
             model,
+            lang,
             prompt::system_prompt(lang),
             prompt::user_prompt(ctx, lang),
         )
@@ -67,7 +68,7 @@ impl Provider for ClaudeCodeProvider {
         // JSON does not contain the answer.
         let user = prompt::qa_transcript_prompt(session, question, lang);
         let stream = self
-            .run(model, prompt::qa_system_prompt(lang), user)
+            .run(model, lang, prompt::qa_system_prompt(lang), user)
             .await?;
         // The caller appends the assistant turn once it has consumed the stream.
         session.history.push(crate::Turn {
@@ -80,7 +81,13 @@ impl Provider for ClaudeCodeProvider {
 
 impl ClaudeCodeProvider {
     /// Spawn the CLI, feed `user` on stdin, and stream the decoded text back.
-    async fn run(&self, model: &str, system: &str, user: String) -> Result<TextStream, LlmError> {
+    async fn run(
+        &self,
+        model: &str,
+        lang: Language,
+        system: &str,
+        user: String,
+    ) -> Result<TextStream, LlmError> {
         let mut child = Command::new(&self.bin)
             .arg("-p")
             .arg("--output-format")
@@ -98,6 +105,18 @@ impl ClaudeCodeProvider {
             // configured: 60-90 extra tool definitions and startup up to the
             // `system/init` event of 1.9s instead of 0.9s. This provider never
             // calls a tool — the whole answer is in the prompt.
+            // The user's own `language` setting otherwise decides the output
+            // language, and it beats the system prompt: with
+            // `"language": "Japanese"` in `~/.claude/settings.json`, `--lang en`
+            // produced Japanese for every explanation. `--settings` is merged
+            // over the user's, so naming the language here — and only the
+            // language — puts `Language` back in charge without disturbing
+            // anything else they have configured.
+            .arg("--settings")
+            .arg(format!(
+                r#"{{"language":"{}"}}"#,
+                lang.cli_settings_name()
+            ))
             .arg("--strict-mcp-config")
             .arg("--mcp-config")
             .arg(r#"{"mcpServers":{}}"#)

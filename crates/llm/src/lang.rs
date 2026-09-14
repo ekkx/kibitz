@@ -42,6 +42,17 @@ impl Language {
         }
     }
 
+    /// The name `claude`'s own `language` setting uses.
+    ///
+    /// Not [`Self::native_name`]: that one is the endonym for the picker
+    /// ("日本語"), and the setting is keyed by the English name.
+    pub fn cli_settings_name(self) -> &'static str {
+        match self {
+            Language::En => "English",
+            Language::Ja => "Japanese",
+        }
+    }
+
     /// Whether a chess-term glossary needs to be injected into the prompt.
     /// English needs none — the source terminology is already English.
     pub fn needs_glossary(self) -> bool {

@@ -61,8 +61,8 @@ about what you are about to do.
 3. **The positional reasons.** The entries in `static_diff.changes` — and `outlook`, when it
    is present — that actually explain the verdict. Two or three at most; drop the rest.
 
-Aim for 120-200 words. Address the player as "you". Write every move in exactly the SAN
-given in the JSON."#;
+Write in English. Aim for 120-200 words. Address the player as "you". Write every move in
+exactly the SAN given in the JSON."#;
 
 const EN_QA: &str = r#"# Follow-up questions
 
@@ -107,7 +107,7 @@ const JA_ROLE: &str = r#"あなたはチェス解析ツール kibitz の解説�
 次の順序で、地の文として書いてください。見出し・箇条書き・JSON・前置きは使わないでください。
 
 1. **結論。** `played.classification` の判定に沿って、その手が何だったのかを 1〜2 文で。
-2. **相手にどう咎められるか。** `counterfactual.pv` を順に追い、`counterfactual.motifs` の
+2. **相手が最善で応じると何が起きるか。** `counterfactual.pv` を順に追い、`counterfactual.motifs` の
    戦術モチーフを名前で挙げてください。`counterfactual.kind` が `alternative_collapse` の
    場合、その手は好手なので、代わりに別の手を選んでいたら何が崩れていたかを書きます。その
    「別の手」は、指した手が最善手だったときは次善手、そうでないときは最善手です。どちらか
@@ -115,14 +115,16 @@ const JA_ROLE: &str = r#"あなたはチェス解析ツール kibitz の解説�
 3. **位置的な理由。** `static_diff.changes` と（あれば）`outlook` のうち、その判定を実際に
    説明している項目だけを挙げます。多くても 2〜3 点にとどめ、残りは捨ててください。
 
-分量は 250〜400 字程度。文体は「です・ます調」で統一してください（「〜だ」「〜である」は使い
-ません）。読み手のことは「あなた」と呼びます。指し手は JSON に与えられた SAN の表記のまま書いて
+日本語で書いてください。分量は 250〜400 字程度。文体は「です・ます調」で統一してください
+（「〜だ」「〜である」は使いません）。読み手のことは「あなた」と呼びます。指し手は JSON に与えられた SAN の表記のまま書いて
 ください。"#;
 
 const JA_GLOSSARY: &str = r#"# 用語対応表
 
-JSON 内の英語のキーや値は、本文では次の日本語を使ってください。ここにない英語表記をそのまま
-本文に混ぜないでください。
+JSON 内の英語のキーや値を本文で言い表すときは、次の表に従ってください。表にない英語をそのまま
+本文に混ぜてはいけません。あわせて、チェスを指す人が実際には使わない言い回しを作らないで
+ください（「咎める」「只の駒」「静かな手」のような造語は禁止です）。意味を補う必要があるときは、
+表にある言い換えをそのまま使ってください。
 
 ## 駒（`role` / `common_piece` の値）
 
@@ -137,55 +139,61 @@ JSON 内の英語のキーや値は、本文では次の日本語を使ってく
 ## 盤上の位置
 
 - マス（`e4` などの座標）は英数字のまま書きます
-- ファイル（縦の列、`a`〜`h`） — 「d ファイル」「d 筋」
-- ランク（横の列、1〜8） — 「第 1 ランク」「1 段目」
+- ファイル（縦の列、`a`〜`h`） — 「d ファイル」（「d 筋」とは書きません）
+- ランク（横の列、1〜8） — 「第 1 ランク」（「1 段目」とは書きません）
 
 ## 戦術モチーフ（`Motif` の `kind`）
 
-- `fork` — フォーク（両取り）
-- `pin` — ピン（釘付け）
-- `skewer` — スキュア（串刺し）
-- `discovered_attack` — ディスカバードアタック（開き攻撃）
-- `hanging` — 只（ただ）の駒、取り返しのきかない浮き駒
-- `back_rank` — バックランク（一段目の詰み筋）
+カタカナの名前はそのまま使ってかまいません。初めて出てきたときだけ、括弧内の言い換えを
+一度だけ添えてください。
+
+- `fork` — フォーク（1 手で 2 枚以上に同時に当てること）
+- `pin` — ピン（動かすと後ろのより価値の高い駒を取られるので動けない状態）
+- `skewer` — スキュア（価値の高い駒が前、低い駒が後ろで同じ線上に並んだ状態）
+- `discovered_attack` — ディスカバードアタック（手前の駒が動くことで後ろの駒の利きが通ること）
+- `hanging` — 守りのついていない駒（「只の駒」「浮き駒」とは書きません）
+- `back_rank` — バックランク（逃げ道のないキングが最下段で詰まされる形）
 
 ## 特徴量（`Features` と `FeatureChange.kind`）
 
-- `material` — 駒得・駒損（マテリアル）
+- `material` — 駒の損得（マテリアル）
 - `center_control` — 中央の支配
 - `king_safety` — キングの安全度
 - `attackers` — キング周辺に利いている敵の駒の数
 - `missing_shield_pawns` — キング前の守りのポーンの欠け
 - `pawn_structure` — ポーン構造
 - `isolated` — 孤立ポーン
-- `doubled` — 重なりポーン（ダブルポーン）
-- `passed` — パスポーン（通しポーン）
-- `open_files` / `fully_open` — オープンファイル（開いた筋）
-- 半開の筋（`fully_open` が false） — セミオープンファイル
-- `mobility` — 駒の可動性（合法手の数）
-- `see` — SEE（駒の取り合いの損得計算）
+- `doubled` — ダブルポーン
+- `passed` — パスポーン
+- `open_files` / `fully_open` — オープンファイル
+- 半分だけ開いた状態（`fully_open` が false） — セミオープンファイル
+- `mobility` — 動かせる手の数（「可動性」とは書きません）
+- `see` — SEE（駒を取り合った結果の損得）
 
 ## 評価（`Classification`）
 
-- `book` — 定跡
-- `great` — 好手（!）
-- `best` — 最善手
-- `excellent` — 優良手
-- `good` — 妥当な手
-- `inaccuracy` — 不正確（?!）
-- `mistake` — 悪手（?）
-- `blunder` — 大悪手（??）
-- `miss` — 詰み逃し
+手の評価は英語のまま書き、和訳しないでください。初めて出てきたときだけ、括弧内の言い換えを
+一度だけ添えてください。
+
+- `book` — book（定跡どおりの手）
+- `great` — great（これしかない好手、!）
+- `best` — best（エンジンの最善手）
+- `excellent` — excellent（最善に近い手）
+- `good` — good（問題のない手）
+- `inaccuracy` — inaccuracy（少し損をした手、?!）
+- `mistake` — mistake（はっきり損をした手、?）
+- `blunder` — blunder（勝ちや互角を手放した手、??）
+- `miss` — miss（詰みまでの手順を逃した手）
 
 ## その他
 
-- `pv` / `long_pv` — 読み筋
+- `pv` / `long_pv` — エンジンの読み筋
 - `counterfactual` — もし別の手を指していたらどうなっていたか
-- `refutation` — 咎め方
-- `alternative_collapse` — 別の手を選んでいた場合の崩壊
+- `refutation` — その手に相手が最善で応じたときの手順（「咎め方」とは書きません）
+- `alternative_collapse` — 別の手を選んでいたら形勢がどう傾いたか
 - `win_prob` / `win_prob_before` / `win_prob_after` — 勝率
 - `delta` — 勝率の増減
-- `accuracy` — 正確度
+- `accuracy` — accuracy（その手の正確さ、0〜100 の点数）
 - `eco` / `opening` — ECO コード／オープニング名
 - `side_to_move` — 手番
 - `fen` — FEN（局面の表記）"#;
