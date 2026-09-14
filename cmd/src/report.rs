@@ -84,10 +84,23 @@ pub fn render(headers: &HashMap<String, String>, entries: &[MoveEntry<'_>]) -> S
 
         if played.classification == Classification::Book {
             if let Some(opening) = &context.opening {
-                out.push_str(&format!(
-                    "Theory: {} {} (matched {} plies).\n\n",
-                    opening.eco, opening.name, opening.matched_plies
-                ));
+                // A `Book` verdict without a name is the normal case, not a
+                // fault: since the Explorer outage the verdict comes from
+                // `eco::in_theory`, which indexes every position a line passes
+                // through, while names come from the positions lines *end* on
+                // (`server::opening`). Printing the empty fields anyway leaves
+                // "Theory:   (matched 3 plies)" with a hole in the middle.
+                if opening.eco.is_empty() && opening.name.is_empty() {
+                    out.push_str(&format!(
+                        "Opening theory (matched {} plies).\n\n",
+                        opening.matched_plies
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "Theory: {} {} (matched {} plies).\n\n",
+                        opening.eco, opening.name, opening.matched_plies
+                    ));
+                }
             } else {
                 out.push_str("Opening theory.\n\n");
             }
@@ -305,5 +318,27 @@ mod tests {
         assert!(markdown.contains("Theory: C97 Ruy Lopez (matched 24 plies)."), "{markdown}");
         // The placeholder win probabilities on a book move must never be printed.
         assert!(!markdown.contains("Win probability"), "{markdown}");
+    }
+
+    #[test]
+    fn a_book_move_whose_position_has_no_name_does_not_print_an_empty_one() {
+        let mut book = analysis("e4", Classification::Book, 1, "white");
+        if let Some(context) = book.context.as_mut() {
+            context.opening = Some(kibitz_core::types::OpeningInfo {
+                eco: String::new(),
+                name: String::new(),
+                matched_plies: 3,
+            });
+        }
+        let entries = [MoveEntry {
+            analysis: &book,
+            explanation: None,
+        }];
+        let markdown = render(&HashMap::new(), &entries);
+        assert!(
+            markdown.contains("Opening theory (matched 3 plies)."),
+            "{markdown}"
+        );
+        assert!(!markdown.contains("Theory:  "), "{markdown}");
     }
 }
